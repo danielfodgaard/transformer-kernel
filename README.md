@@ -38,9 +38,16 @@ I picked the **PyTorch** track.
 
 | Path | Description |
 | --- | --- |
-| `src/torch_transformer_benchmark.py` | The organisers' benchmark harness (Python 3 + PyTorch). Contains `BaselineTransformer`, the `UserOptimizedTransformer` class to fill in, the accuracy comparison, and the latency benchmark. |
+| `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
+| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
+| `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
+| `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
+| `configs/shapes.json` | The 14 appendix test shapes. |
+| `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
 
-The upstream script was last updated 27 August 2026.
+The upstream script was last updated 27 August 2026. It is kept byte-identical
+to what the organisers shipped; for submission the body of `OptimizedTransformer`
+is pasted into the `UserOptimizedTransformer` stub.
 
 ## Setup
 
@@ -52,29 +59,39 @@ pip install torch          # CUDA build matching your GPU — see pytorch.org
 
 ## Reproducing the results
 
-Run the benchmark with its defaults (batch 8, seq len 128, `d_model` 512,
-8 heads, FFN 2048, 6 layers, float32, device auto-detected):
+Sweep every appendix shape and write the numbers to `results/`:
 
 ```bash
-python src/torch_transformer_benchmark.py
+python src/sweep.py --skip 14 --out results/pass1-fp16.json
 ```
 
-Useful flags:
+Case 14 is skipped because it does not fit on a 16 GB GPU — see
+`docs/pass1-decisions.md`. Anything after `--` is forwarded to the run, so
+precision modes and `torch.compile` are reachable from the sweep:
 
 ```bash
-# sweep a different shape
-python src/torch_transformer_benchmark.py --batch-size 32 --seq-len 1024 --d-model 1024
+python src/sweep.py --cases 1,7,8,13 --out results/fp32.json -- --precision fp32
+python src/sweep.py --cases 1 --out results/noise-floor.json -- --reference-check
+```
 
-# half precision on a specific GPU, causal masking
-python src/torch_transformer_benchmark.py --device cuda:0 --dtype float16 --causal
+A single shape, with the harness's own flags:
 
-# torch.compile the optimized side only
-python src/torch_transformer_benchmark.py --compile-user --compile-mode max-autotune
+```bash
+python src/run_case.py --causal --batch-size 64 --d-model 128 \
+  --heads 4 --seq-len 128 --layers 4 --ffn-dim 128
+
+python src/run_case.py --precision autocast --compile-user
+```
+
+The stock baseline-vs-baseline harness still runs on its own:
+
+```bash
+python src/torch_transformer_benchmark.py --help
 ```
 
 Accuracy thresholds default to the competition values (`--rtol 0.02`,
 `--atol 0.002`). Timing defaults are 20 warmup iterations and 100 repeats over
-3 rounds; `--help` lists every flag.
+3 rounds, alternating baseline and optimized to cancel clock drift.
 
 ## Test shapes
 
@@ -134,14 +151,24 @@ python src/torch_transformer_benchmark.py --causal \
 
 ## Status
 
-The optimized path is still the stock baseline — `UserOptimizedTransformer.forward`
-currently delegates to `super().forward()`, so the script runs end to end and
-reports a ~1x speedup. Kernel work is next.
+Pass one is written but **not yet measured**. The optimizations in
+`src/optimized.py` are PyTorch-level only: fused Q/K/V projection,
+`scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
+tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
+LayerNorm statistics and softmax accumulation left in fp32, and the per-layer
+causal mask hoisted out of the layer loop.
+
+Reference point on a Tesla T4, stock baseline vs. the unmodified stub
+(batch 8, seq 128, `d_model` 512, 8 heads, FFN 2048, 6 layers, non-causal,
+fp32, torch 2.10.0+cu128): baseline median 13.857 ms, 73 900 token/s. That is
+40.3 GFLOP per forward, or ~2.9 TFLOPS — about 36% of the T4's 8.1 TFLOPS fp32
+peak, against ~65 TFLOPS available on its fp16 tensor cores.
 
 ## Limitations and next steps
 
-- No custom kernel yet; the first targets are fused attention via
-  `scaled_dot_product_attention`, then fused LayerNorm + residual and FFN.
+- **No results yet.** Nothing in this repo has been run on a GPU; the numbers
+  above are the organisers' baseline, not a measurement of the optimized path.
+- No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
+- Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
+  T4 in either implementation and needs sequential batch chunking.
 - Shape-specialised dispatch (small vs. large sequence length) is not written.
-- Numbers have not been collected on the target GPU, so no performance figures
-  are quoted here yet.
