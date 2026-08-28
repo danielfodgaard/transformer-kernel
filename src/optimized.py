@@ -6,10 +6,11 @@ challenge (TikTok Jam Session 2026).
 This module deliberately lives *outside* the organizers' benchmark file. The
 benchmark (``torch_transformer_benchmark.py``) is kept byte-identical to what
 the organizers shipped; ``run_case.py`` swaps this class in at runtime. For the
-final submission the body of ``OptimizedTransformer`` can be pasted into the
-``UserOptimizedTransformer`` stub without any other change.
+final submission the body of ``OptimizedTransformer`` (together with the
+contents of ``fused_kernels.py``) can be pasted into the ``UserOptimizedTransformer``
+stub without any other change.
 
-Pass one is PyTorch-level only -- no custom Triton or CUDA kernels:
+Pass one was PyTorch-level only; pass two adds the first custom kernels:
 
   1. The three Q/K/V projections are fused into a single matmul and split.
   2. Attention goes through ``F.scaled_dot_product_attention`` instead of a
@@ -18,6 +19,11 @@ Pass one is PyTorch-level only -- no custom Triton or CUDA kernels:
      LayerNorm statistics and the softmax accumulation stay in fp32.
   4. ``torch.compile`` is NOT applied here -- the benchmark already exposes it
      as ``--compile-user``, so its contribution can be measured separately.
+  5. On the dense (no-padding) path, every residual add + LayerNorm + cast
+     triple runs as one fused Triton kernel (``fused_kernels.py``), so the fp32
+     residual stream stops round-tripping DRAM between elementwise ops.
+     ``--no-fused-norm`` restores the eager chain; environments without
+     triton or CUDA fall back to it automatically.
 
 Hard constraints imposed by the benchmark (see docs/pass1-decisions.md):
 
@@ -39,6 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import fused_kernels
 from torch_transformer_benchmark import BaselineTransformer, TransformerConfig
 
 __all__ = ["OptimizerSettings", "OptimizedTransformer", "configure", "active_settings"]
@@ -78,6 +85,12 @@ class OptimizerSettings:
     # Skip the one device->host sync per forward that checks whether the
     # padding mask is all-True. Only safe when --padding-ratio is 0.
     assume_dense_mask: bool = False
+
+    # Run the residual adds + LayerNorms of the dense path in fused Triton
+    # kernels (fused_kernels.py). Off restores the eager pass-one chain; when
+    # triton is missing or the tensors are not on CUDA the eager chain is
+    # used regardless of this setting.
+    fused_norm: bool = True
 
 
 _ACTIVE = OptimizerSettings()
@@ -332,6 +345,12 @@ class OptimizedTransformer(BaselineTransformer):
         batch, seq_len, _ = x.shape
         causal = self.config.causal
         weights = self._weights(compute_dtype)
+
+        if mask is None and self.settings.fused_norm and fused_kernels.can_fuse(x):
+            return self._run_layers_fused(
+                x, weights, batch, seq_len, causal, compute_dtype
+            )
+
         normalized_shape = (self.d_model,)
 
         # Precompute the three mask views the baseline needs, once instead of
@@ -361,47 +380,8 @@ class OptimizedTransformer(BaselineTransformer):
             )
             if compute_dtype is not None:
                 h = h.to(compute_dtype)
-
-            if layer_weights.qkv_weight is not None:
-                qkv = F.linear(h, layer_weights.qkv_weight, layer_weights.qkv_bias)
-                # qkv is contiguous, so this view is free. Layout is
-                # [B, S, {q,k,v}, H, head_dim] -> three [B, H, S, head_dim].
-                qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
-                q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-            else:
-                q = self._split_heads(
-                    F.linear(h, layer_weights.q_weight, layer_weights.q_bias),
-                    batch,
-                    seq_len,
-                )
-                k = self._split_heads(
-                    F.linear(h, layer_weights.k_weight, layer_weights.k_bias),
-                    batch,
-                    seq_len,
-                )
-                v = self._split_heads(
-                    F.linear(h, layer_weights.v_weight, layer_weights.v_bias),
-                    batch,
-                    seq_len,
-                )
-
-            if self.settings.attention == "sdpa":
-                with _sdpa_backend(self.settings.sdpa_backend):
-                    context = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        attn_mask=attn_allow,
-                        dropout_p=0.0,
-                        is_causal=use_is_causal,
-                        scale=self.attn_scale,
-                    )
-            else:
-                context = self._math_attention(q, k, v, attn_allow, use_is_causal)
-
-            context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
-            attn_out = F.linear(
-                context, layer_weights.out_weight, layer_weights.out_bias
+            attn_out = self._attention_block(
+                h, layer_weights, batch, seq_len, attn_allow, use_is_causal
             )
             if invalid_tokens is not None:
                 attn_out = attn_out.masked_fill(invalid_tokens, 0)
@@ -417,11 +397,7 @@ class OptimizedTransformer(BaselineTransformer):
             )
             if compute_dtype is not None:
                 h = h.to(compute_dtype)
-            h = F.linear(h, layer_weights.ffn_in_weight, layer_weights.ffn_in_bias)
-            # approximate="none" (erf) matches the baseline exactly; the tanh
-            # approximation would introduce a needless ~1e-3 difference.
-            h = F.gelu(h, approximate="none")
-            h = F.linear(h, layer_weights.ffn_out_weight, layer_weights.ffn_out_bias)
+            h = self._ffn_block(h, layer_weights)
             x = x + h.to(x.dtype)
 
             if invalid_tokens is not None:
@@ -437,6 +413,138 @@ class OptimizedTransformer(BaselineTransformer):
         if invalid_tokens is not None:
             x = x.masked_fill(invalid_tokens, 0)
         return x
+
+    def _run_layers_fused(
+        self,
+        x: torch.Tensor,
+        weights: List[_LayerWeights],
+        batch: int,
+        seq_len: int,
+        causal: bool,
+        compute_dtype: Optional[torch.dtype],
+    ) -> torch.Tensor:
+        """Dense fast path with the fused Triton residual+LayerNorm kernels.
+
+        Op order is identical to the eager loop -- residual adds and LayerNorm
+        statistics in fp32, only matmul operands in the compute dtype -- but
+        each (add, LayerNorm, cast) triple is one kernel launch. Every
+        residual add in this architecture is immediately followed by a
+        LayerNorm (norm2 after attention; the next layer's norm1 or the final
+        norm after the FFN), so two fused calls per layer carry the whole
+        stream, and the final fused call emits the model output directly.
+        Padding masks never reach this path.
+        """
+        matmul_dtype = compute_dtype if compute_dtype is not None else x.dtype
+        last = len(weights) - 1
+
+        h = fused_kernels.ln_fwd(
+            x,
+            weights[0].norm1_weight,
+            weights[0].norm1_bias,
+            weights[0].norm1_eps,
+            out_dtype=matmul_dtype,
+        )
+        out = x  # always overwritten; num_layers is validated positive
+        for index, layer_weights in enumerate(weights):
+            attn_out = self._attention_block(
+                h, layer_weights, batch, seq_len, None, causal
+            )
+            x, h = fused_kernels.add_ln_fwd(
+                x,
+                attn_out,
+                layer_weights.norm2_weight,
+                layer_weights.norm2_bias,
+                layer_weights.norm2_eps,
+                out_dtype=matmul_dtype,
+            )
+            ffn_out = self._ffn_block(h, layer_weights)
+            if index < last:
+                next_weights = weights[index + 1]
+                x, h = fused_kernels.add_ln_fwd(
+                    x,
+                    ffn_out,
+                    next_weights.norm1_weight,
+                    next_weights.norm1_bias,
+                    next_weights.norm1_eps,
+                    out_dtype=matmul_dtype,
+                )
+            else:
+                # The last residual add feeds final_norm directly, so the
+                # final fused call produces the model output; the summed
+                # residual it also writes is dead.
+                _, out = fused_kernels.add_ln_fwd(
+                    x,
+                    ffn_out,
+                    self.final_norm.weight,
+                    self.final_norm.bias,
+                    self.final_norm.eps,
+                    out_dtype=x.dtype,
+                )
+        return out
+
+    def _attention_block(
+        self,
+        h: torch.Tensor,
+        layer_weights: _LayerWeights,
+        batch: int,
+        seq_len: int,
+        attn_allow: Optional[torch.Tensor],
+        use_is_causal: bool,
+    ) -> torch.Tensor:
+        """Q/K/V projection, attention, and output projection.
+
+        ``h`` is the already-normalized block input in the matmul dtype;
+        the return value is the attention branch output before the residual
+        add, in the same dtype.
+        """
+        if layer_weights.qkv_weight is not None:
+            qkv = F.linear(h, layer_weights.qkv_weight, layer_weights.qkv_bias)
+            # qkv is contiguous, so this view is free. Layout is
+            # [B, S, {q,k,v}, H, head_dim] -> three [B, H, S, head_dim].
+            qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        else:
+            q = self._split_heads(
+                F.linear(h, layer_weights.q_weight, layer_weights.q_bias),
+                batch,
+                seq_len,
+            )
+            k = self._split_heads(
+                F.linear(h, layer_weights.k_weight, layer_weights.k_bias),
+                batch,
+                seq_len,
+            )
+            v = self._split_heads(
+                F.linear(h, layer_weights.v_weight, layer_weights.v_bias),
+                batch,
+                seq_len,
+            )
+
+        if self.settings.attention == "sdpa":
+            with _sdpa_backend(self.settings.sdpa_backend):
+                context = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_allow,
+                    dropout_p=0.0,
+                    is_causal=use_is_causal,
+                    scale=self.attn_scale,
+                )
+        else:
+            context = self._math_attention(q, k, v, attn_allow, use_is_causal)
+
+        context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+        return F.linear(context, layer_weights.out_weight, layer_weights.out_bias)
+
+    def _ffn_block(
+        self, h: torch.Tensor, layer_weights: _LayerWeights
+    ) -> torch.Tensor:
+        h = F.linear(h, layer_weights.ffn_in_weight, layer_weights.ffn_in_bias)
+        # approximate="none" (erf) matches the baseline exactly; the tanh
+        # approximation would introduce a needless ~1e-3 difference.
+        h = F.gelu(h, approximate="none")
+        return F.linear(h, layer_weights.ffn_out_weight, layer_weights.ffn_out_bias)
 
     def _split_heads(
         self, projected: torch.Tensor, batch: int, seq_len: int

@@ -39,7 +39,9 @@ I picked the **PyTorch** track.
 | Path | Description |
 | --- | --- |
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
-| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
+| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream, fused Triton residual+LayerNorm kernels on the dense path. |
+| `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
+| `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
@@ -168,7 +170,10 @@ peak, against ~65 TFLOPS available on its fp16 tensor cores.
 
 - **No results yet.** Nothing in this repo has been run on a GPU; the numbers
   above are the organisers' baseline, not a measurement of the optimized path.
-- No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
+- The first custom kernels are in (`src/fused_kernels.py`: fused residual-add +
+  LayerNorm + cast for the fp32 stream); attention itself still goes through
+  SDPA. A fused attention kernel for the degenerate `head_dim=8` shape
+  (appendix case 11) is the natural next kernel.
 - Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
   T4 in either implementation and needs sequential batch chunking.
 - Shape-specialised dispatch (small vs. large sequence length) is not written.
