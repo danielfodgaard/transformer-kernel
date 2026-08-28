@@ -43,6 +43,7 @@ I picked the **PyTorch** track.
 | `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
 | `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
+| `src/run_case14.py` | Out-of-core runner for appendix case 14, which the official harness cannot grade on any hardware. Chunked fp16 candidate vs a chunked fp32 proxy reference, validated against the true baseline at a feasible sequence length. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
 | `src/dispatch.py` | Data-driven shape dispatch: scans `results/*.json`, keeps the fastest accuracy-passing settings per shape, and writes `configs/dispatch.json`; `run_case.py --dispatch` applies it. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
@@ -68,8 +69,18 @@ Sweep every appendix shape and write the numbers to `results/`:
 python src/sweep.py --skip 14 --out results/pass1-fp16.json
 ```
 
-Case 14 is skipped because it does not fit on a 16 GB GPU — see
-`docs/pass1-decisions.md`. Anything after `--` is forwarded to the run, so
+Case 14 is skipped because the *baseline* cannot run it anywhere: its
+materialized `[32, 16, 100000, 100000]` score tensor is ~20 TB, and the fp32
+input activation alone is 13.1 GB on a 15 GB T4 — see
+`docs/pass1-decisions.md`. The optimized path *can* run it; `run_case14.py`
+does so out of core and grades it against a validated fp32 proxy reference:
+
+```bash
+python src/run_case14.py --max-samples 4   # quick read (~a few minutes)
+python src/run_case14.py                   # full accuracy pass + timing
+```
+
+Anything after `--` is forwarded to the run, so
 precision modes and `torch.compile` are reachable from the sweep:
 
 ```bash
