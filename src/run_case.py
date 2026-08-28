@@ -19,6 +19,10 @@ the flags added here all control the optimized implementation:
     --fp32-reductions                  forbid fp16 partial-sum accumulation
                                        inside cuBLAS fp16 matmuls (accuracy-
                                        margin knob; baseline is unaffected)
+    --cuda-graphs                      capture the dense forward into a CUDA
+                                       graph and replay it (single launch per
+                                       call; do not combine with
+                                       --compile-user)
     --reference-check                  run the baseline against itself, which
                                        measures the harness's own noise floor
 
@@ -51,6 +55,7 @@ EXTRA_FLAGS = (
     "--no-fused-norm",
     "--assume-dense-mask",
     "--fp32-reductions",
+    "--cuda-graphs",
     "--reference-check",
 )
 
@@ -72,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-fused-norm", action="store_true")
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--fp32-reductions", action="store_true")
+    parser.add_argument("--cuda-graphs", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
 
@@ -108,7 +114,17 @@ def main() -> int:
             fused_norm=not args.no_fused_norm,
             assume_dense_mask=args.assume_dense_mask,
         )
-        bench.UserOptimizedTransformer = optimized.OptimizedTransformer
+        if args.cuda_graphs:
+            if "--compile-user" in passthrough:
+                print(
+                    "[warning] --cuda-graphs with --compile-user is untested; "
+                    "prefer one or the other"
+                )
+            import cuda_graphs  # deferred: pulls in the CUDA graph wrapper
+
+            bench.UserOptimizedTransformer = cuda_graphs.GraphedTransformer
+        else:
+            bench.UserOptimizedTransformer = optimized.OptimizedTransformer
         print(
             "optimizer: "
             f"precision={settings.precision} "
@@ -117,7 +133,8 @@ def main() -> int:
             f"fuse_qkv={settings.fuse_qkv} "
             f"fused_norm={settings.fused_norm} "
             f"assume_dense_mask={settings.assume_dense_mask} "
-            f"fp32_reductions={args.fp32_reductions}"
+            f"fp32_reductions={args.fp32_reductions} "
+            f"cuda_graphs={args.cuda_graphs}"
         )
 
     return bench.main()
