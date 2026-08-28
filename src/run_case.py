@@ -14,6 +14,9 @@ the flags added here all control the optimized implementation:
     --sdpa-backend {auto,efficient,math,flash}
     --no-fuse-qkv                      keep three separate Q/K/V matmuls
     --assume-dense-mask                skip the all-True mask check (sync)
+    --fp32-reductions                  forbid fp16 partial-sum accumulation
+                                       inside cuBLAS fp16 matmuls (accuracy-
+                                       margin knob; baseline is unaffected)
     --reference-check                  run the baseline against itself, which
                                        measures the harness's own noise floor
 
@@ -33,6 +36,8 @@ SRC_DIR = pathlib.Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import torch  # noqa: E402
+
 import torch_transformer_benchmark as bench  # noqa: E402
 import optimized  # noqa: E402
 
@@ -42,6 +47,7 @@ EXTRA_FLAGS = (
     "--sdpa-backend",
     "--no-fuse-qkv",
     "--assume-dense-mask",
+    "--fp32-reductions",
     "--reference-check",
 )
 
@@ -61,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
     parser.add_argument("--assume-dense-mask", action="store_true")
+    parser.add_argument("--fp32-reductions", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
 
@@ -75,6 +82,14 @@ def main() -> int:
 
     # Hand the remaining argv to the benchmark's parse_args() untouched.
     sys.argv = [sys.argv[0]] + passthrough
+
+    if args.fp32_reductions:
+        # cuBLAS may split an fp16 GEMM along K and accumulate the partial
+        # sums in fp16; this forbids that, keeping every reduction in fp32.
+        # Only fp16 matmuls are affected, so the fp32 baseline is untouched.
+        # Costs a little GEMM speed; buys absolute-error margin on the shapes
+        # that sit near the 2e-3 tolerance (appendix case 7 measured 1.97e-3).
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
     if args.reference_check:
         # Baseline vs baseline: any deviation from 1.00x is harness noise.
@@ -95,7 +110,8 @@ def main() -> int:
             f"attention={settings.attention} "
             f"sdpa_backend={settings.sdpa_backend} "
             f"fuse_qkv={settings.fuse_qkv} "
-            f"assume_dense_mask={settings.assume_dense_mask}"
+            f"assume_dense_mask={settings.assume_dense_mask} "
+            f"fp32_reductions={args.fp32_reductions}"
         )
 
     return bench.main()
