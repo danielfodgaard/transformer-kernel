@@ -41,6 +41,7 @@ I picked the **PyTorch** track.
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
 | `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
+| `src/run_case14.py` | Out-of-core runner for appendix case 14, which the official harness cannot grade on any hardware. Chunked fp16 candidate vs a chunked fp32 proxy reference, validated against the true baseline at a feasible sequence length. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
@@ -65,8 +66,18 @@ Sweep every appendix shape and write the numbers to `results/`:
 python src/sweep.py --skip 14 --out results/pass1-fp16.json
 ```
 
-Case 14 is skipped because it does not fit on a 16 GB GPU — see
-`docs/pass1-decisions.md`. Anything after `--` is forwarded to the run, so
+Case 14 is skipped because the *baseline* cannot run it anywhere: its
+materialized `[32, 16, 100000, 100000]` score tensor is ~20 TB, and the fp32
+input activation alone is 13.1 GB on a 15 GB T4 — see
+`docs/pass1-decisions.md`. The optimized path *can* run it; `run_case14.py`
+does so out of core and grades it against a validated fp32 proxy reference:
+
+```bash
+python src/run_case14.py --max-samples 4   # quick read (~a few minutes)
+python src/run_case14.py                   # full accuracy pass + timing
+```
+
+Anything after `--` is forwarded to the run, so
 precision modes and `torch.compile` are reachable from the sweep:
 
 ```bash
