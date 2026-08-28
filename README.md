@@ -42,6 +42,7 @@ I picked the **PyTorch** track.
 | `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
+| `src/dispatch.py` | Data-driven shape dispatch: scans `results/*.json`, keeps the fastest accuracy-passing settings per shape, and writes `configs/dispatch.json`; `run_case.py --dispatch` applies it. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
 
@@ -171,4 +172,9 @@ peak, against ~65 TFLOPS available on its fp16 tensor cores.
 - No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
 - Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
   T4 in either implementation and needs sequential batch chunking.
-- Shape-specialised dispatch (small vs. large sequence length) is not written.
+- Shape-specialised dispatch is data-driven rather than hand-written: after
+  sweeping settings variants, `python src/dispatch.py` distills the fastest
+  accuracy-passing configuration per appendix shape into
+  `configs/dispatch.json`, and `--dispatch` applies it (explicit flags still
+  win). The table is only as good as the sweeps behind it — re-run the
+  generator after measuring new variants.

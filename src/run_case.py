@@ -14,6 +14,10 @@ the flags added here all control the optimized implementation:
     --sdpa-backend {auto,efficient,math,flash}
     --no-fuse-qkv                      keep three separate Q/K/V matmuls
     --assume-dense-mask                skip the all-True mask check (sync)
+    --dispatch                         apply the measured-best settings for
+                                       this shape from configs/dispatch.json
+                                       (generate with src/dispatch.py);
+                                       explicit flags still win
     --reference-check                  run the baseline against itself, which
                                        measures the harness's own noise floor
 
@@ -42,6 +46,7 @@ EXTRA_FLAGS = (
     "--sdpa-backend",
     "--no-fuse-qkv",
     "--assume-dense-mask",
+    "--dispatch",
     "--reference-check",
 )
 
@@ -61,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
     parser.add_argument("--assume-dense-mask", action="store_true")
+    parser.add_argument("--dispatch", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
 
@@ -70,11 +76,50 @@ def main() -> int:
         print(__doc__)
         print("Flags below are the benchmark's own:\n")
 
+    raw_argv = list(sys.argv[1:])
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
 
     # Hand the remaining argv to the benchmark's parse_args() untouched.
     sys.argv = [sys.argv[0]] + passthrough
+
+    dispatch_overrides = {}
+    dispatch_note = None
+    if args.dispatch and not args.reference_check:
+        import dispatch  # deferred: only needed when the table is in play
+
+        table = dispatch.load_table()
+        if table is None:
+            dispatch_note = (
+                "no table at configs/dispatch.json (generate with "
+                "src/dispatch.py); using command-line settings"
+            )
+        else:
+            # The benchmark re-parses the same argv inside bench.main(); this
+            # early parse only reads the shape, so parsing twice is harmless.
+            shape = bench.parse_args()
+            entry = dispatch.lookup(
+                table,
+                batch_size=shape.batch_size,
+                seq_len=shape.seq_len,
+                d_model=shape.d_model,
+                heads=shape.heads,
+                layers=shape.layers,
+                ffn_dim=shape.ffn_dim,
+                causal=shape.causal,
+            )
+            if entry is None:
+                dispatch_note = "shape not in table; using command-line settings"
+            else:
+                explicit = dispatch.explicit_setting_fields(raw_argv)
+                dispatch_overrides = dispatch.applicable_settings(
+                    entry["settings"], explicit
+                )
+                dispatch_note = (
+                    f"applied {dispatch_overrides or 'nothing new'} "
+                    f"from {entry['source']} "
+                    f"(measured {entry['median_ms']} ms)"
+                )
 
     if args.reference_check:
         # Baseline vs baseline: any deviation from 1.00x is harness noise.
@@ -88,6 +133,8 @@ def main() -> int:
             fuse_qkv=not args.no_fuse_qkv,
             assume_dense_mask=args.assume_dense_mask,
         )
+        if dispatch_overrides:
+            settings = optimized.configure(**dispatch_overrides)
         bench.UserOptimizedTransformer = optimized.OptimizedTransformer
         print(
             "optimizer: "
@@ -97,6 +144,8 @@ def main() -> int:
             f"fuse_qkv={settings.fuse_qkv} "
             f"assume_dense_mask={settings.assume_dense_mask}"
         )
+        if dispatch_note is not None:
+            print(f"dispatch: {dispatch_note}")
 
     return bench.main()
 
