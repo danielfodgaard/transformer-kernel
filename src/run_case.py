@@ -13,6 +13,8 @@ the flags added here all control the optimized implementation:
     --attention {sdpa,math}            fused SDPA or the baseline's attention
     --sdpa-backend {auto,efficient,math,flash}
     --no-fuse-qkv                      keep three separate Q/K/V matmuls
+    --no-fused-norm                    eager residual+LayerNorm chain instead
+                                       of the fused Triton kernels
     --assume-dense-mask                skip the all-True mask check (sync)
     --reference-check                  run the baseline against itself, which
                                        measures the harness's own noise floor
@@ -41,6 +43,7 @@ EXTRA_FLAGS = (
     "--attention",
     "--sdpa-backend",
     "--no-fuse-qkv",
+    "--no-fused-norm",
     "--assume-dense-mask",
     "--reference-check",
 )
@@ -60,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
+    parser.add_argument("--no-fused-norm", action="store_true")
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
@@ -86,6 +90,7 @@ def main() -> int:
             attention=args.attention,
             sdpa_backend=args.sdpa_backend,
             fuse_qkv=not args.no_fuse_qkv,
+            fused_norm=not args.no_fused_norm,
             assume_dense_mask=args.assume_dense_mask,
         )
         bench.UserOptimizedTransformer = optimized.OptimizedTransformer
@@ -95,6 +100,7 @@ def main() -> int:
             f"attention={settings.attention} "
             f"sdpa_backend={settings.sdpa_backend} "
             f"fuse_qkv={settings.fuse_qkv} "
+            f"fused_norm={settings.fused_norm} "
             f"assume_dense_mask={settings.assume_dense_mask}"
         )
 

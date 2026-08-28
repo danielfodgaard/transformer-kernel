@@ -39,7 +39,9 @@ I picked the **PyTorch** track.
 | Path | Description |
 | --- | --- |
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
-| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
+| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream, fused Triton residual+LayerNorm kernels on the dense path. |
+| `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
+| `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
@@ -208,8 +210,11 @@ causal mask hoisted out of the layer loop.
 
 ## Limitations and next steps
 
-- No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
-  A fused LayerNorm+residual Triton kernel is the next planned step.
+- The first custom kernels are in (`src/fused_kernels.py`: fused residual-add +
+  LayerNorm + cast for the fp32 stream) but **not yet measured** — the table
+  above predates them; gate with `src/test_kernels.py` before the next sweep.
+  A fused attention kernel for the degenerate `head_dim=8` shape (appendix
+  case 11) is the natural next kernel.
 - The launch-overhead-bound shapes (2, 3, 4, 12) are pinned at ~1.4 ms by
   kernel launch cost; CUDA graphs via `--compile-user --compile-mode
   reduce-overhead` target this and need re-measurement after the cache fix.
