@@ -106,6 +106,17 @@ the default because it's silently wrong otherwise.
 
 **Decide:** whether to measure with it on for the small cases.
 
+**Update after the first Kaggle run:** the check is now memoized per mask
+object (weakref identity), so the sync happens once per distinct mask tensor
+rather than once per forward. The harness reuses a single mask for all warmup
+and timed calls, so steady state pays no sync — and, more importantly, the
+per-forward sync was forcing the host to drain the queue on every call, which
+exposed every kernel-launch gap inside the timed window on the small shapes.
+Memoization restores cross-iteration pipelining while keeping the padded path
+correct. `--assume-dense-mask` remains as the skip-even-the-first-sync
+variant, and any fp16-vs-memoized delta it still shows is the true cost of
+that one remaining sync.
+
 ---
 
 ## E. Where the fused causal mask is built
