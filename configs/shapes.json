@@ -1,0 +1,21 @@
+{
+  "name": "appendix",
+  "description": "The 14 test shapes from the problem statement appendix (section 3.7). 'QKV Dim' in the appendix table is d_model. Every case is causal.",
+  "cases": [
+    {"id": 1,  "batch_size": 64,    "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "reference"},
+    {"id": 2,  "batch_size": 1,     "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "batch"},
+    {"id": 3,  "batch_size": 4,     "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "batch"},
+    {"id": 4,  "batch_size": 16,    "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "batch"},
+    {"id": 5,  "batch_size": 128,   "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "batch"},
+    {"id": 6,  "batch_size": 10000, "d_model": 128,  "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "batch"},
+    {"id": 7,  "batch_size": 64,    "d_model": 32,   "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 32,   "group": "width"},
+    {"id": 8,  "batch_size": 64,    "d_model": 1024, "heads": 4,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 1024, "group": "width"},
+    {"id": 9,  "batch_size": 64,    "d_model": 128,  "heads": 1,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "heads"},
+    {"id": 10, "batch_size": 64,    "d_model": 128,  "heads": 2,  "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "heads"},
+    {"id": 11, "batch_size": 64,    "d_model": 128,  "heads": 16, "seq_len": 128,    "layers": 4, "causal": true, "ffn_dim": 128,  "group": "heads"},
+    {"id": 12, "batch_size": 64,    "d_model": 128,  "heads": 4,  "seq_len": 32,     "layers": 4, "causal": true, "ffn_dim": 128,  "group": "seq"},
+    {"id": 13, "batch_size": 64,    "d_model": 128,  "heads": 4,  "seq_len": 1024,   "layers": 4, "causal": true, "ffn_dim": 128,  "group": "seq"},
+    {"id": 14, "batch_size": 32,    "d_model": 1024, "heads": 16, "seq_len": 100000, "layers": 2, "causal": true, "ffn_dim": 1024, "group": "seq",
+     "note": "Infeasible on a 15GB T4: the fp32 activation alone is 32*100000*1024*4 = 13.1GB, and the baseline additionally materializes a [32,16,100000,100000] score tensor. Needs batch chunking; expected to OOM in pass one."}
+  ]
+}
