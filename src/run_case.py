@@ -23,6 +23,10 @@ the flags added here all control the optimized implementation:
                                        graph and replay it (single launch per
                                        call; do not combine with
                                        --compile-user)
+    --dispatch                         apply the measured-best settings for
+                                       this shape from configs/dispatch.json
+                                       (generate with src/dispatch.py);
+                                       explicit flags still win
     --reference-check                  run the baseline against itself, which
                                        measures the harness's own noise floor
 
@@ -56,6 +60,7 @@ EXTRA_FLAGS = (
     "--assume-dense-mask",
     "--fp32-reductions",
     "--cuda-graphs",
+    "--dispatch",
     "--reference-check",
 )
 
@@ -78,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--fp32-reductions", action="store_true")
     parser.add_argument("--cuda-graphs", action="store_true")
+    parser.add_argument("--dispatch", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
 
@@ -87,6 +93,7 @@ def main() -> int:
         print(__doc__)
         print("Flags below are the benchmark's own:\n")
 
+    raw_argv = list(sys.argv[1:])
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
 
@@ -101,6 +108,44 @@ def main() -> int:
         # that sit near the 2e-3 tolerance (appendix case 7 measured 1.97e-3).
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
+    dispatch_overrides = {}
+    dispatch_note = None
+    if args.dispatch and not args.reference_check:
+        import dispatch  # deferred: only needed when the table is in play
+
+        table = dispatch.load_table()
+        if table is None:
+            dispatch_note = (
+                "no table at configs/dispatch.json (generate with "
+                "src/dispatch.py); using command-line settings"
+            )
+        else:
+            # The benchmark re-parses the same argv inside bench.main(); this
+            # early parse only reads the shape, so parsing twice is harmless.
+            shape = bench.parse_args()
+            entry = dispatch.lookup(
+                table,
+                batch_size=shape.batch_size,
+                seq_len=shape.seq_len,
+                d_model=shape.d_model,
+                heads=shape.heads,
+                layers=shape.layers,
+                ffn_dim=shape.ffn_dim,
+                causal=shape.causal,
+            )
+            if entry is None:
+                dispatch_note = "shape not in table; using command-line settings"
+            else:
+                explicit = dispatch.explicit_setting_fields(raw_argv)
+                dispatch_overrides = dispatch.applicable_settings(
+                    entry["settings"], explicit
+                )
+                dispatch_note = (
+                    f"applied {dispatch_overrides or 'nothing new'} "
+                    f"from {entry['source']} "
+                    f"(measured {entry['median_ms']} ms)"
+                )
+
     if args.reference_check:
         # Baseline vs baseline: any deviation from 1.00x is harness noise.
         bench.UserOptimizedTransformer = bench.BaselineTransformer
@@ -114,6 +159,8 @@ def main() -> int:
             fused_norm=not args.no_fused_norm,
             assume_dense_mask=args.assume_dense_mask,
         )
+        if dispatch_overrides:
+            settings = optimized.configure(**dispatch_overrides)
         if args.cuda_graphs:
             if "--compile-user" in passthrough:
                 print(
@@ -136,6 +183,8 @@ def main() -> int:
             f"fp32_reductions={args.fp32_reductions} "
             f"cuda_graphs={args.cuda_graphs}"
         )
+        if dispatch_note is not None:
+            print(f"dispatch: {dispatch_note}")
 
     return bench.main()
 

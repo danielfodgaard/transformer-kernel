@@ -44,6 +44,7 @@ I picked the **PyTorch** track.
 | `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
+| `src/dispatch.py` | Data-driven shape dispatch: scans `results/*.json`, keeps the fastest accuracy-passing settings per shape, and writes `configs/dispatch.json`; `run_case.py --dispatch` applies it. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
 
@@ -226,3 +227,9 @@ causal mask hoisted out of the layer loop.
   the baseline's per-sample score tensor would be 640 GB, so the reference is
   uncomputable on any hardware. Our path needs sequential batch chunking;
   validation methodology is an open question for the organisers.
+- Shape-specialised dispatch is data-driven rather than hand-written: after
+  sweeping settings variants, `python src/dispatch.py` distills the fastest
+  accuracy-passing configuration per appendix shape into
+  `configs/dispatch.json`, and `--dispatch` applies it (explicit flags still
+  win). The table is only as good as the sweeps behind it — re-run the
+  generator after measuring new variants.
