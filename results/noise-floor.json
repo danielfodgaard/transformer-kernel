@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-28T08:33:59+0000",
+  "passthrough_args": [
+    "--reference-check"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "reference-check (baseline vs baseline)"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 1,
+        "batch_size": 64,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "reference"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--reference-check"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 9.57,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "reference-check (baseline vs baseline)",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.0,
+        "max_relative_error": 0.0,
+        "failed_elements": 0,
+        "total_elements": 5242880
+      },
+      "baseline": {
+        "median_ms": 9.4122,
+        "mean_ms": 9.4188,
+        "p90_ms": 9.4533,
+        "min_ms": 9.3441,
+        "tokens_per_second": 870356.04
+      },
+      "optimized": {
+        "median_ms": 9.4119,
+        "mean_ms": 9.4143,
+        "p90_ms": 9.4495,
+        "min_ms": 9.3355,
+        "tokens_per_second": 870387.13
+      },
+      "speedup": 1.0
+    }
+  ]
+}

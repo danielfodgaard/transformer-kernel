@@ -149,26 +149,75 @@ python src/torch_transformer_benchmark.py --causal \
 | Feasibility & Practicality | 15% |
 | Presentation & Communication (final event only) | 10% |
 
+## Results (measured)
+
+Tesla T4, torch 2.10.0+cu128, fp32 baseline, fp16 optimized path, harness
+defaults (5 accuracy trials, 20 warmup, 3x100 alternating repeats, median of
+300 CUDA-event samples). Raw data in `results/pass1-fp16.json`; the
+baseline-vs-baseline noise floor measured 1.000x (`results/noise-floor.json`).
+All 13 runnable cases pass accuracy with zero failed elements.
+
+| # | Shape (b/s/d/h/l/ffn) | Baseline ms | Optimized ms | Speedup | max_abs |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 64/128/128/4/4/128 | 9.44 | 2.44 | **3.87x** | 1.4e-03 |
+| 2 | 1/128/128/4/4/128 | 3.25 | 1.48 | 2.19x | 1.4e-03 |
+| 3 | 4/128/128/4/4/128 | 3.55 | 1.53 | 2.32x | 1.6e-03 |
+| 4 | 16/128/128/4/4/128 | 3.31 | 1.43 | 2.32x | 1.5e-03 |
+| 5 | 128/128/128/4/4/128 | 18.41 | 4.96 | 3.71x | 1.7e-03 |
+| 6 | 10000/128/128/4/4/128 | 1486.38 | 407.55 | 3.65x | 1.9e-03 |
+| 7 | 64/128/32/4/4/32 | 6.31 | 1.43 | 4.41x | 2.0e-03 |
+| 8 | 64/128/1024/4/4/1024 | 140.57 | 34.09 | 4.12x | 1.5e-03 |
+| 9 | 64/128/128/1/4/128 | 6.51 | 2.59 | 2.51x | 1.4e-03 |
+| 10 | 64/128/128/2/4/128 | 8.00 | 2.60 | 3.08x | 1.6e-03 |
+| 11 | 64/128/128/16/4/128 | 22.45 | 3.47 | **6.46x** | 1.4e-03 |
+| 12 | 64/32/128/4/4/128 | 3.17 | 1.38 | 2.30x | 1.5e-03 |
+| 13 | 64/1024/128/4/4/128 | 324.52 | 28.83 | **11.26x** | 1.5e-03 |
+
+Geometric mean speedup: **3.56x**.
+
+A separate ablation session (same GPU model) decomposed the win: with the fp16
+path disabled (`--precision fp32`, structural changes only) case 1 gives
+1.96x, case 8 gives 1.09x, and case 13 gives 4.48x - so on GEMM-heavy shapes
+the tensor-core path is nearly the whole speedup, while at long sequence
+length avoiding the materialised score tensor dominates. `--precision
+autocast` matched the cached-fp16 default within noise except on the smallest
+model (case 7: 3.51x vs 4.49x), where re-casting every weight each call is
+proportionally expensive.
+
+The cases fall into three regimes: launch-overhead-bound (2, 3, 4, 12: ~2.3x,
+optimized latency pinned at ~1.4 ms regardless of batch size),
+compute/bandwidth-bound (1, 5, 6, 8: 3.6-4.1x), and score-memory-bound
+(11, 13: 6.5-11.3x, where the baseline's `[B, H, S, S]` fp32 score tensor
+scales with heads and sequence length).
+
+`--compile-user --compile-mode reduce-overhead` initially failed on every
+case: the lazily built weight cache allocated its tensors inside the
+CUDA-graph region, and graph replays overwrote them
+(`results/pass1-fp16-compiled.json` records the failure). The cache builders
+are now wrapped in `torch.compiler.disable`; the compiled configuration is
+pending re-measurement.
+
 ## Status
 
-Pass one is written but **not yet measured**. The optimizations in
+Pass one is implemented and measured (table above). The optimizations in
 `src/optimized.py` are PyTorch-level only: fused Q/K/V projection,
 `scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
 tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
 LayerNorm statistics and softmax accumulation left in fp32, and the per-layer
 causal mask hoisted out of the layer loop.
 
-Reference point on a Tesla T4, stock baseline vs. the unmodified stub
-(batch 8, seq 128, `d_model` 512, 8 heads, FFN 2048, 6 layers, non-causal,
-fp32, torch 2.10.0+cu128): baseline median 13.857 ms, 73 900 token/s. That is
-40.3 GFLOP per forward, or ~2.9 TFLOPS — about 36% of the T4's 8.1 TFLOPS fp32
-peak, against ~65 TFLOPS available on its fp16 tensor cores.
-
 ## Limitations and next steps
 
-- **No results yet.** Nothing in this repo has been run on a GPU; the numbers
-  above are the organisers' baseline, not a measurement of the optimized path.
 - No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
+  A fused LayerNorm+residual Triton kernel is the next planned step.
+- The launch-overhead-bound shapes (2, 3, 4, 12) are pinned at ~1.4 ms by
+  kernel launch cost; CUDA graphs via `--compile-user --compile-mode
+  reduce-overhead` target this and need re-measurement after the cache fix.
+- Case 7's accuracy margin is thin (max_abs 0.00197 of the 0.002 budget);
+  shape-dispatching `d_model <= 32` to fp32 is under consideration - the
+  problem statement explicitly allows per-shape implementations.
 - Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
-  T4 in either implementation and needs sequential batch chunking.
-- Shape-specialised dispatch (small vs. large sequence length) is not written.
+  T4 in either implementation: the fp32 input activation alone is 13.1 GB and
+  the baseline's per-sample score tensor would be 640 GB, so the reference is
+  uncomputable on any hardware. Our path needs sequential batch chunking;
+  validation methodology is an open question for the organisers.
