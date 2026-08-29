@@ -44,6 +44,22 @@ from torch_transformer_benchmark import BaselineTransformer, TransformerConfig
 __all__ = ["OptimizerSettings", "OptimizedTransformer", "configure", "active_settings"]
 
 
+def _outside_compile(fn):
+    """Keep a cache-building method out of any torch.compile'd graph.
+
+    The lazily built caches below store tensors across calls. If they were
+    allocated inside a compiled region under --compile-mode reduce-overhead,
+    they would live in CUDA-graph-owned memory and be overwritten by the next
+    graph replay (observed as "output of CUDAGraphs ... overwritten by a
+    subsequent run" on every test shape). torch.compiler.disable forces these
+    methods to run eagerly, so their tensors are ordinary allocations that are
+    safe to cache; the harness's --compile-user path still compiles the rest
+    of the forward around them.
+    """
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    return disable(fn) if disable is not None else fn
+
+
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
@@ -196,6 +212,7 @@ class OptimizedTransformer(BaselineTransformer):
             return None  # already reduced precision; leave it alone
         return torch.float16
 
+    @_outside_compile
     def _weights(self, compute_dtype: Optional[torch.dtype]) -> List[_LayerWeights]:
         """Fused + pre-cast weights, built once per (device, dtype) combination.
 
@@ -271,6 +288,7 @@ class OptimizedTransformer(BaselineTransformer):
         self._weight_cache_key = key
         return built
 
+    @_outside_compile
     def _causal_allow_mask(
         self, seq_len: int, device: torch.device
     ) -> torch.Tensor:
@@ -291,6 +309,7 @@ class OptimizedTransformer(BaselineTransformer):
         self._causal_cache_key = key
         return mask
 
+    @_outside_compile
     def _mask_is_dense(self, valid_token_mask: Optional[torch.Tensor]) -> bool:
         """True when no token is padded, so all masking can be skipped.
 
