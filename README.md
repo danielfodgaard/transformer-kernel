@@ -173,7 +173,51 @@ All 13 runnable cases pass accuracy with zero failed elements.
 | 12 | 64/32/128/4/4/128 | 3.17 | 1.38 | 2.30x | 1.5e-03 |
 | 13 | 64/1024/128/4/4/128 | 324.52 | 28.83 | **11.26x** | 1.5e-03 |
 
-Geometric mean speedup: **3.56x**.
+Geometric mean speedup: **3.56x** eager.
+
+### With torch.compile (CUDA graphs)
+
+`--compile-user --compile-mode reduce-overhead` on top of the same fp16 path
+(`results/pass2-fp16-compiled.json`) lifts every case, most of all the
+launch-overhead-bound ones, whose ~1.4 ms floor drops to ~0.7 ms:
+
+| # | Eager | Compiled | Optimized ms |
+| --- | --- | --- | --- |
+| 1 | 3.87x | **6.00x** | 1.63 |
+| 2 | 2.19x | **4.20x** | 0.69 |
+| 3 | 2.32x | **4.11x** | 0.70 |
+| 4 | 2.32x | **3.92x** | 0.73 |
+| 5 | 3.71x | **6.54x** | 2.94 |
+| 6 | 3.65x | OOM (see below) | 407.55 (eager) |
+| 7 | 4.41x | **7.39x** | 0.85 |
+| 8 | 4.12x | **5.10x** | 28.59 |
+| 9 | 2.51x | **4.05x** | 1.66 |
+| 10 | 3.08x | **4.97x** | 1.66 |
+| 11 | 6.46x | **8.91x** | 2.57 |
+| 12 | 2.30x | **4.11x** | 0.75 |
+| 13 | 11.26x | **16.32x** | 19.92 |
+
+Geometric mean with the best configuration per case (compiled everywhere,
+eager for case 6): **5.52x**. Case 6 compiled hits CUDA out of memory - not in
+our code, but in the *baseline's* forward: CUDA graphs pin ~2.8 GB of private
+pools for the compiled model, and at batch 10000 the baseline's ~10 GB of
+transient fp32 score tensors no longer fit beside them on 14.6 GB. The
+per-case configuration lives in `configs/best.json`
+(`python src/sweep.py --config configs/best.json --skip 14`).
+
+### Accuracy stress and the d32 dispatch
+
+A 25-trial stress test of case 7 (`results/case7-stress-a.json`) **failed**:
+one element out of 6.5M reached abs error 0.00208 against the 0.002 budget.
+The 5-trial official run passes, but a margin that a seed sweep can break is
+not shippable. `d_model < 64` therefore dispatches to fp32
+(`fp16_min_d_model=64`, tunable via `--fp16-min-d-model`) - the problem
+statement explicitly allows per-shape implementations. fp32 keeps the
+structural speedups (2.93x eager on case 7) at ~2e-6 error; the compiled fp32
+number for case 7 is pending. Caveat noted for the report: worst-element
+error is an extreme-value statistic, so other cases' margins (case 6 sits at
+0.00187 over 5 trials) also shrink as trial count grows - a wider stress
+sweep is on the list.
 
 A separate ablation session (same GPU model) decomposed the win: with the fp16
 path disabled (`--precision fp32`, structural changes only) case 1 gives
@@ -194,8 +238,8 @@ scales with heads and sequence length).
 case: the lazily built weight cache allocated its tensors inside the
 CUDA-graph region, and graph replays overwrote them
 (`results/pass1-fp16-compiled.json` records the failure). The cache builders
-are now wrapped in `torch.compiler.disable`; the compiled configuration is
-pending re-measurement.
+are now wrapped in `torch.compiler.disable`; the compiled table above is the
+post-fix re-measurement.
 
 ## Status
 
@@ -210,12 +254,13 @@ causal mask hoisted out of the layer loop.
 
 - No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
   A fused LayerNorm+residual Triton kernel is the next planned step.
-- The launch-overhead-bound shapes (2, 3, 4, 12) are pinned at ~1.4 ms by
-  kernel launch cost; CUDA graphs via `--compile-user --compile-mode
-  reduce-overhead` target this and need re-measurement after the cache fix.
-- Case 7's accuracy margin is thin (max_abs 0.00197 of the 0.002 budget);
-  shape-dispatching `d_model <= 32` to fp32 is under consideration - the
-  problem statement explicitly allows per-shape implementations.
+- Case 6 cannot use CUDA graphs on a 16 GB card while the baseline shares the
+  device; `--compile-mode default` (fusion without graph pools) is untested
+  and might recover part of the gap.
+- The d32 fp32 dispatch and the compiled-fp32 case 7 number need a
+  verification run (`configs/best.json` sweep).
+- Accuracy margins are extreme-value statistics; only case 7 has been
+  stress-tested beyond the official 5 trials so far.
 - Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
   T4 in either implementation: the fp32 input activation alone is 13.1 GB and
   the baseline's per-sample score tensor would be 640 GB, so the reference is
