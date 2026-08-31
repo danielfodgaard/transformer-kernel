@@ -213,8 +213,8 @@ pending re-measurement.
 
 ## Status
 
-Pass one is implemented and measured (table above). The optimizations in
-`src/optimized.py` are PyTorch-level only: fused Q/K/V projection,
+Pass one is implemented and measured (table above). The pass-one
+optimizations that table measures are PyTorch-level only: fused Q/K/V projection,
 `scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
 tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
 LayerNorm statistics and softmax accumulation left in fp32, and the per-layer
@@ -222,22 +222,27 @@ causal mask hoisted out of the layer loop.
 
 ## Limitations and next steps
 
-- The first custom kernels are in (`src/fused_kernels.py`: fused residual-add +
-  LayerNorm + cast for the fp32 stream) but **not yet measured** — the table
-  above predates them; gate with `src/test_kernels.py` before the next sweep.
-  A fused attention kernel for the degenerate `head_dim=8` shape (appendix
-  case 11) is the natural next kernel.
+- **Pass two is implemented but not yet measured** — the table above is pass
+  one. New since that measurement: the fused Triton residual+LayerNorm
+  kernels (`src/fused_kernels.py`, on by default; gate with
+  `src/test_kernels.py` first), the memoized dense-mask check,
+  `--fp32-reductions`, `--cuda-graphs`, `--dispatch`, and `src/run_case14.py`.
 - The launch-overhead-bound shapes (2, 3, 4, 12) are pinned at ~1.4 ms by
-  kernel launch cost; CUDA graphs via `--compile-user --compile-mode
-  reduce-overhead` target this and need re-measurement after the cache fix.
+  kernel launch cost. Two remedies are in the tree and should be measured
+  against each other, never combined: `--compile-user --compile-mode
+  reduce-overhead` (pending re-measurement after the cache fix) and the new
+  `--cuda-graphs`.
 - Case 7's accuracy margin is thin (max_abs 0.00197 of the 0.002 budget);
-  shape-dispatching `d_model <= 32` to fp32 is under consideration - the
-  problem statement explicitly allows per-shape implementations.
-- Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
-  T4 in either implementation: the fp32 input activation alone is 13.1 GB and
-  the baseline's per-sample score tensor would be 640 GB, so the reference is
-  uncomputable on any hardware. Our path needs sequential batch chunking;
-  validation methodology is an open question for the organisers.
+  `--fp32-reductions` is the cheap knob to measure, and shape-dispatching
+  `d_model <= 32` to fp32 remains an option — the problem statement
+  explicitly allows per-shape implementations.
+- Appendix case 14 cannot be graded by the official harness on any hardware
+  (the baseline's score tensor is uncomputable). `src/run_case14.py` now runs
+  it out of core against a validated fp32 proxy reference; it needs its first
+  GPU run, and the official validation methodology remains a question for the
+  organisers.
+- A fused attention kernel for the degenerate `head_dim=8` shape (appendix
+  case 11) is the natural next kernel.
 - Shape-specialised dispatch is data-driven rather than hand-written: after
   sweeping settings variants, `python src/dispatch.py` distills the fastest
   accuracy-passing configuration per appendix shape into
