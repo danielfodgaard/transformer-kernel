@@ -279,7 +279,12 @@ on the launch-bound cases 1–4 and 12, plain defaults elsewhere):
 | 12 | 4.11x | **6.95x** | 0.42 | cuda-graphs |
 | 13 | 16.32x | **16.98x** | 18.75 | default |
 
-Geometric mean: **7.11x** (was 5.52x). Case 7's drop is the deliberate
+Geometric mean: **7.11x** (was 5.52x), and the full `configs/best.json`
+configuration verified end to end in a single sweep at **7.32x**
+(`results/best-verify.json`, case 2 reaching 11.1x). CUDA graphs
+subsequently also measured wins on cases 9 (4.25→4.89x) and 10
+(5.24→5.93x) (`results/pass2-cg-mid.json`), now in `best.json`; with those
+the best-configuration geometric mean is **7.45x**. Case 7's drop is the deliberate
 accuracy trade — its fp16 margin failed a 25-trial stress, so it runs fp32.
 All 13 cases pass accuracy; case 14 additionally passes out-of-core (below).
 
@@ -296,6 +301,11 @@ causal mask hoisted out of the layer loop.
 
 - The Triton kernels earn their place: `--no-fused-norm` costs case 1
   1.40→2.62 ms, case 5 2.66→5.27 ms, case 13 18.8→28.2 ms.
+- `--dispatch` is fixed (table values are typed now) and verified on GPU.
+  One design limit: the table applies only `OptimizerSettings` fields, so it
+  cannot switch on run-level mechanisms like `--cuda-graphs` — for the
+  launch-bound shapes `configs/best.json` is the authoritative best config,
+  and the dispatch table is the fallback for unlisted shapes.
 - Manual `--cuda-graphs` beats `torch.compile reduce-overhead` on every
   launch-bound shape (0.30–0.43 ms vs 0.54–0.57 ms replay latency) and
   compile beats the plain defaults nowhere now that the Triton kernels cover
@@ -310,7 +320,8 @@ causal mask hoisted out of the layer loop.
   mechanism as case 7, but the fp32 hammer would cost most of case 6's 7.3x,
   so the default stays fp16 with the fragility documented;
   `--fp16-max-elements 100000000` dispatches oversized forwards to fp32 for
-  seed-robustness at that price (cost not yet measured).
+  seed-robustness — measured at 2.28x (654.7 ms) vs 7.3x fp16, error 2.1e-6
+  (`results/case6-fp32-escape.json`): robustness costs case 6 a factor ~3.
 - Case 6 and compile: `reduce-overhead` OOMs beside the baseline at batch
   10000, and `--compile-mode default` measured no gain over the fused
   defaults (7.34x vs 7.35x). It runs plain defaults.

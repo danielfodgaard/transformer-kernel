@@ -1,0 +1,200 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-31T10:19:52+0000",
+  "passthrough_args": [
+    "--dispatch"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp16_max_elements=0 fp32_reductions=False cuda_graphs=False"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 1,
+        "batch_size": 64,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "reference"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--dispatch"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 9.81,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp16_max_elements=0 fp32_reductions=False cuda_graphs=False",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00142058,
+        "max_relative_error": 437.842,
+        "failed_elements": 0,
+        "total_elements": 5242880
+      },
+      "baseline": {
+        "median_ms": 10.187,
+        "mean_ms": 10.1791,
+        "p90_ms": 10.2131,
+        "min_ms": 10.0208,
+        "tokens_per_second": 804160.26
+      },
+      "optimized": {
+        "median_ms": 1.5182,
+        "mean_ms": 1.5276,
+        "p90_ms": 1.595,
+        "min_ms": 1.4049,
+        "tokens_per_second": 5396005.74
+      },
+      "speedup": 6.71
+    },
+    {
+      "case": {
+        "id": 2,
+        "batch_size": 1,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "batch"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "1",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--dispatch"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 7.44,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp16_max_elements=0 fp32_reductions=False cuda_graphs=False",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00136152,
+        "max_relative_error": 133.504,
+        "failed_elements": 0,
+        "total_elements": 81920
+      },
+      "baseline": {
+        "median_ms": 3.0543,
+        "mean_ms": 3.0888,
+        "p90_ms": 3.2693,
+        "min_ms": 2.8645,
+        "tokens_per_second": 41908.07
+      },
+      "optimized": {
+        "median_ms": 1.5355,
+        "mean_ms": 1.5613,
+        "p90_ms": 1.6591,
+        "min_ms": 1.401,
+        "tokens_per_second": 83362.86
+      },
+      "speedup": 1.989
+    },
+    {
+      "case": {
+        "id": 12,
+        "batch_size": 64,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 32,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "seq"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "32",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--dispatch"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 7.39,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp16_max_elements=0 fp32_reductions=False cuda_graphs=False",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00153053,
+        "max_relative_error": 312.378,
+        "failed_elements": 0,
+        "total_elements": 1310720
+      },
+      "baseline": {
+        "median_ms": 3.0477,
+        "mean_ms": 3.0709,
+        "p90_ms": 3.3132,
+        "min_ms": 1.7733,
+        "tokens_per_second": 671979.49
+      },
+      "optimized": {
+        "median_ms": 1.4622,
+        "mean_ms": 1.4951,
+        "p90_ms": 1.6138,
+        "min_ms": 1.3236,
+        "tokens_per_second": 1400636.85
+      },
+      "speedup": 2.084
+    }
+  ]
+}

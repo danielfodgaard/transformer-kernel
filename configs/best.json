@@ -1,6 +1,6 @@
 {
   "name": "best",
-  "description": "The appendix shapes with the measured-best per-case configuration on a Tesla T4 (results/pass2-default.json and results/pass2-cg.json). Manual CUDA-graph capture wins on the launch-bound shapes (1-4, 12: replay latency down to 0.30ms); the plain pass-2 defaults (fused Triton norms + fp16 + SDPA) win everywhere else - torch.compile no longer earns its place on any case now that the Triton kernels cover the elementwise fusion. Case 7's fp32 dispatch is in-model. Run: python src/sweep.py --config configs/best.json --skip 14; case 14 runs via src/run_case14.py.",
+  "description": "The appendix shapes with the measured-best per-case configuration on a Tesla T4 (results/pass2-default.json and results/pass2-cg.json). Manual CUDA-graph capture wins on the launch-bound and mid shapes (1-4, 9-10, 12: replay latency down to 0.30ms); the plain pass-2 defaults (fused Triton norms + fp16 + SDPA) win everywhere else - torch.compile no longer earns its place on any case now that the Triton kernels cover the elementwise fusion. Case 7's fp32 dispatch is in-model. Run: python src/sweep.py --config configs/best.json --skip 14; case 14 runs via src/run_case14.py.",
   "cases": [
     {
       "id": 1,
@@ -112,7 +112,10 @@
       "layers": 4,
       "causal": true,
       "ffn_dim": 128,
-      "group": "heads"
+      "group": "heads",
+      "extra_args": [
+        "--cuda-graphs"
+      ]
     },
     {
       "id": 10,
@@ -123,7 +126,10 @@
       "layers": 4,
       "causal": true,
       "ffn_dim": 128,
-      "group": "heads"
+      "group": "heads",
+      "extra_args": [
+        "--cuda-graphs"
+      ]
     },
     {
       "id": 11,
