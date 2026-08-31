@@ -59,15 +59,23 @@ SHAPE_FIELDS = (
     "causal",
 )
 
-def _settings_fields() -> set:
-    """Field names of OptimizerSettings, resolved lazily.
+def _field_types() -> Dict[str, type]:
+    """Field name -> declared type of OptimizerSettings, resolved lazily.
 
     Imported inside the function so that table *generation* stays runnable
     without torch installed; only applying a table needs the real dataclass.
     """
     from optimized import OptimizerSettings
 
-    return {field.name for field in dataclasses.fields(OptimizerSettings)}
+    types: Dict[str, type] = {}
+    for field in dataclasses.fields(OptimizerSettings):
+        if field.type in ("int", int):
+            types[field.name] = int
+        elif field.type in ("bool", bool):
+            types[field.name] = bool
+        else:
+            types[field.name] = str
+    return types
 
 
 # Command-line spellings of the OptimizerSettings fields in run_case.py; used
@@ -80,6 +88,7 @@ FLAG_TO_FIELD = {
     "--no-fused-norm": "fused_norm",
     "--assume-dense-mask": "assume_dense_mask",
     "--fp16-min-d-model": "fp16_min_d_model",
+    "--fp16-max-elements": "fp16_max_elements",
 }
 
 
@@ -111,7 +120,10 @@ def parse_optimizer_line(text: str) -> Dict[str, object]:
         elif value == "False":
             settings[key] = False
         else:
-            settings[key] = value
+            try:
+                settings[key] = int(value)
+            except ValueError:
+                settings[key] = value
     return settings
 
 
@@ -142,12 +154,22 @@ def applicable_settings(
 ) -> Dict[str, object]:
     """The table settings that are real OptimizerSettings fields and were
     not explicitly set on the command line."""
-    valid = _settings_fields()
-    return {
-        key: value
-        for key, value in entry_settings.items()
-        if key in valid and key not in explicit
-    }
+    valid = _field_types()
+    applied = {}
+    for key, value in entry_settings.items():
+        if key not in valid or key in explicit:
+            continue
+        # Tables written before values were typed carry strings; coerce
+        # against the real OptimizerSettings field type so an int field is
+        # never handed a str (that broke --dispatch with a TypeError in
+        # _compute_dtype).
+        field_type = valid[key]
+        if field_type is int and not isinstance(value, bool):
+            value = int(value)
+        elif field_type is bool and isinstance(value, str):
+            value = value == "True"
+        applied[key] = value
+    return applied
 
 
 # --------------------------------------------------------------------------- #

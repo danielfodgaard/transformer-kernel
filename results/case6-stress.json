@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-31T04:50:40+0000",
+  "passthrough_args": [
+    "--accuracy-trials",
+    "25",
+    "--warmup",
+    "0",
+    "--repeats",
+    "1",
+    "--benchmark-rounds",
+    "1"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp32_reductions=False cuda_graphs=False"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 6,
+        "batch_size": 10000,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "batch"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "10000",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--accuracy-trials",
+        "25",
+        "--warmup",
+        "0",
+        "--repeats",
+        "1",
+        "--benchmark-rounds",
+        "1"
+      ],
+      "status": "accuracy_failed",
+      "returncode": 2,
+      "wall_seconds": 49.66,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp32_reductions=False cuda_graphs=False",
+      "accuracy": {
+        "passed": false,
+        "max_abs_error": 0.00207418,
+        "max_relative_error": 463324000.0,
+        "failed_elements": 1,
+        "total_elements": 4096000000
+      },
+      "baseline": null,
+      "optimized": null,
+      "speedup": null,
+      "stderr_tail": ""
+    }
+  ]
+}

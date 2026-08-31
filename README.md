@@ -256,9 +256,36 @@ CUDA-graph region, and graph replays overwrote them
 are now wrapped in `torch.compiler.disable`; the compiled table above is the
 post-fix re-measurement.
 
+### Pass two, measured (fused Triton kernels + CUDA graphs)
+
+Pass two turns on the fused Triton residual+LayerNorm kernels by default and
+adds manual CUDA-graph capture (`--cuda-graphs`). Measured best configuration
+per case (`results/pass2-default.json`, `results/pass2-cg.json`; CUDA graphs
+on the launch-bound cases 1–4 and 12, plain defaults elsewhere):
+
+| # | Pass-1 best | Pass-2 best | Optimized ms | Config |
+| --- | --- | --- | --- | --- |
+| 1 | 6.00x | **7.05x** | 1.42 | cuda-graphs |
+| 2 | 4.20x | **9.55x** | 0.30 | cuda-graphs |
+| 3 | 4.11x | **9.19x** | 0.31 | cuda-graphs |
+| 4 | 3.92x | **6.64x** | 0.43 | cuda-graphs |
+| 5 | 6.54x | **6.98x** | 2.66 | default |
+| 6 | 3.65x | **7.35x** | 198.57 | default |
+| 7 | 7.39x | 3.93x | 1.60 | default (fp32 dispatch: max_abs 1.2e-06) |
+| 8 | 5.10x | 5.09x | 25.23 | default |
+| 9 | 4.05x | **4.43x** | 1.43 | default |
+| 10 | 4.97x | **5.24x** | 1.50 | default |
+| 11 | 8.91x | **10.19x** | 2.18 | default |
+| 12 | 4.11x | **6.95x** | 0.42 | cuda-graphs |
+| 13 | 16.32x | **16.98x** | 18.75 | default |
+
+Geometric mean: **7.11x** (was 5.52x). Case 7's drop is the deliberate
+accuracy trade — its fp16 margin failed a 25-trial stress, so it runs fp32.
+All 13 cases pass accuracy; case 14 additionally passes out-of-core (below).
+
 ## Status
 
-Pass one is implemented and measured (table above). The pass-one
+Pass two is implemented and measured (tables above). The pass-one
 optimizations that table measures are PyTorch-level only: fused Q/K/V projection,
 `scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
 tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
@@ -267,32 +294,31 @@ causal mask hoisted out of the layer loop.
 
 ## Limitations and next steps
 
-- **Pass two is implemented but not yet measured** — the tables above are
-  pass one (eager and compiled). New since those measurements: the fused
-  Triton residual+LayerNorm kernels (`src/fused_kernels.py`, on by default;
-  gate with `src/test_kernels.py` first), the memoized dense-mask check,
-  `--fp32-reductions`, `--cuda-graphs`, `--dispatch`, and `src/run_case14.py`.
-- The launch-overhead-bound shapes (2, 3, 4, 12) dropped from ~1.4 ms to
-  ~0.7 ms under `--compile-user --compile-mode reduce-overhead` (measured);
-  the new `--cuda-graphs` is the unmeasured alternative with zero numerics
-  risk. Measure them against each other, never combined.
-- Case 7's thin margin is resolved: the 25-trial stress test failed at
-  max_abs 0.00208, so `d_model < 64` now dispatches to fp32 in-model
-  (`fp16_min_d_model`). `--fp32-reductions` remains an optional knob for
-  shapes that later turn out marginal. The compiled-fp32 case 7 number and a
-  `configs/best.json` verification sweep are pending.
-- Case 6 cannot use CUDA graphs on a 16 GB card while the baseline shares the
-  device (compiled reduce-overhead OOMs in the baseline's forward);
-  `--compile-mode default` is untested and might recover part of the gap.
-- Accuracy margins are extreme-value statistics; only case 7 has been
-  stress-tested beyond the official 5 trials so far (case 6 sits at 0.00187
-  over 5 trials).
-- Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) cannot be graded
-  by the official harness on any hardware: the fp32 input activation alone is
-  13.1 GB on a 15 GB card and the baseline's per-sample score tensor would be
-  640 GB. `src/run_case14.py` runs it out of core against a validated fp32
-  proxy reference; it needs its first GPU run, and the official validation
-  methodology remains a question for the organisers.
+- The Triton kernels earn their place: `--no-fused-norm` costs case 1
+  1.40→2.62 ms, case 5 2.66→5.27 ms, case 13 18.8→28.2 ms.
+- Manual `--cuda-graphs` beats `torch.compile reduce-overhead` on every
+  launch-bound shape (0.30–0.43 ms vs 0.54–0.57 ms replay latency) and
+  compile beats the plain defaults nowhere now that the Triton kernels cover
+  the elementwise fusion — the best configuration no longer uses
+  `torch.compile` at all.
+- `--fp32-reductions` measured **no effect** on either accuracy (identical
+  max_abs on case 6) or speed (case 8 within noise) — cuBLAS was evidently
+  not using fp16 reductions on this stack to begin with. Kept only as a
+  probe.
+- **Case 6 fails a 25-trial stress** (max_abs 0.00208, 1 element of 4.1B)
+  while passing the official 5-trial run at 0.00187. Same extreme-value
+  mechanism as case 7, but the fp32 hammer would cost most of case 6's 7.3x,
+  so the default stays fp16 with the fragility documented;
+  `--fp16-max-elements 100000000` dispatches oversized forwards to fp32 for
+  seed-robustness at that price (cost not yet measured).
+- Case 6 and compile: `reduce-overhead` OOMs beside the baseline at batch
+  10000, and `--compile-mode default` measured no gain over the fused
+  defaults (7.34x vs 7.35x). It runs plain defaults.
+- **Case 14 runs and passes**: chunked fp16 vs the validated fp32 proxy
+  reference over all 3.28B output elements, max_abs 0.00102, zero failures,
+  155.4 s per forward (`results/case14-full.json`). The official harness
+  still cannot grade it anywhere (the baseline reference is uncomputable);
+  methodology question for the organisers stands.
 - A fused attention kernel for the degenerate `head_dim=8` shape (appendix
   case 11) is the natural next kernel.
 - Shape-specialised dispatch is data-driven rather than hand-written: after
