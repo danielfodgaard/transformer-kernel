@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-31T07:07:40+0000",
+  "passthrough_args": [
+    "--ln",
+    "triton"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "precision=fp16 attention=sdpa ln=triton triton_in_compile=False sdpa_backend=auto fuse_qkv=True assume_dense_mask=False fp16_min_d_model=64"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 1,
+        "batch_size": 64,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "reference"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--ln",
+        "triton"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 13.47,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa ln=triton triton_in_compile=False sdpa_backend=auto fuse_qkv=True assume_dense_mask=False fp16_min_d_model=64",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00142058,
+        "max_relative_error": 226.389,
+        "failed_elements": 0,
+        "total_elements": 5242880
+      },
+      "baseline": {
+        "median_ms": 9.5923,
+        "mean_ms": 9.5983,
+        "p90_ms": 9.6441,
+        "min_ms": 9.5089,
+        "tokens_per_second": 854020.84
+      },
+      "optimized": {
+        "median_ms": 1.5837,
+        "mean_ms": 1.6168,
+        "p90_ms": 1.759,
+        "min_ms": 1.4459,
+        "tokens_per_second": 5172553.17
+      },
+      "speedup": 6.057
+    },
+    {
+      "case": {
+        "id": 5,
+        "batch_size": 128,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "batch"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "128",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--ln",
+        "triton"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 12.89,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa ln=triton triton_in_compile=False sdpa_backend=auto fuse_qkv=True assume_dense_mask=False fp16_min_d_model=64",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00172831,
+        "max_relative_error": 226.389,
+        "failed_elements": 0,
+        "total_elements": 10485760
+      },
+      "baseline": {
+        "median_ms": 18.7205,
+        "mean_ms": 18.746,
+        "p90_ms": 18.846,
+        "min_ms": 18.5744,
+        "tokens_per_second": 875188.25
+      },
+      "optimized": {
+        "median_ms": 3.0679,
+        "mean_ms": 3.0469,
+        "p90_ms": 3.0977,
+        "min_ms": 2.8197,
+        "tokens_per_second": 5340398.33
+      },
+      "speedup": 6.102
+    },
+    {
+      "case": {
+        "id": 6,
+        "batch_size": 10000,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "batch"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "10000",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--ln",
+        "triton"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 603.17,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa ln=triton triton_in_compile=False sdpa_backend=auto fuse_qkv=True assume_dense_mask=False fp16_min_d_model=64",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00186801,
+        "max_relative_error": 385596000.0,
+        "failed_elements": 0,
+        "total_elements": 819200000
+      },
+      "baseline": {
+        "median_ms": 1558.3986,
+        "mean_ms": 1555.1113,
+        "p90_ms": 1564.0521,
+        "min_ms": 1490.3624,
+        "tokens_per_second": 821356.0
+      },
+      "optimized": {
+        "median_ms": 294.0457,
+        "mean_ms": 293.6766,
+        "p90_ms": 297.634,
+        "min_ms": 278.5851,
+        "tokens_per_second": 4353065.52
+      },
+      "speedup": 5.3
+    },
+    {
+      "case": {
+        "id": 13,
+        "batch_size": 64,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 1024,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "seq"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "1024",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--ln",
+        "triton"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 118.33,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa ln=triton triton_in_compile=False sdpa_backend=auto fuse_qkv=True assume_dense_mask=False fp16_min_d_model=64",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00154525,
+        "max_relative_error": 34106700.0,
+        "failed_elements": 0,
+        "total_elements": 41943040
+      },
+      "baseline": {
+        "median_ms": 323.9976,
+        "mean_ms": 325.0639,
+        "p90_ms": 328.4425,
+        "min_ms": 322.856,
+        "tokens_per_second": 202273.08
+      },
+      "optimized": {
+        "median_ms": 22.2752,
+        "mean_ms": 22.1965,
+        "p90_ms": 22.6099,
+        "min_ms": 21.1222,
+        "tokens_per_second": 2942108.18
+      },
+      "speedup": 14.545
+    }
+  ]
+}

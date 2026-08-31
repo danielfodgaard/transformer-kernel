@@ -24,6 +24,14 @@ Pass one was PyTorch-level only; pass two adds the first custom kernels:
      residual stream stops round-tripping DRAM between elementwise ops.
      ``--no-fused-norm`` restores the eager chain; environments without
      triton or CUDA fall back to it automatically.
+  6. ``--attention triton`` (pass three, opt-in, experimental) swaps SDPA for
+     a FlashAttention-2-style Triton kernel (``kernels.py``) that writes its
+     output pre-transposed. Measured on a T4 it LOSES to the CUTLASS
+     memory-efficient SDPA kernel on every appendix shape (e.g. case 11:
+     7.47 ms vs 3.47 ms eager; results/pass3-e2-attn.json), so it exists as
+     a documented negative result and a base for future tuning, not as a
+     default. Padding masks, non-fp16 dtypes, and head_dim > 256 fall back
+     to SDPA.
 
 Hard constraints imposed by the benchmark (see docs/pass1-decisions.md):
 
@@ -47,6 +55,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import fused_kernels
+import kernels
 from torch_transformer_benchmark import BaselineTransformer, TransformerConfig
 
 __all__ = ["OptimizerSettings", "OptimizedTransformer", "configure", "active_settings"]
@@ -88,8 +97,11 @@ class OptimizerSettings:
     # fp32   -- no reduced precision at all (structural wins only).
     precision: str = "fp16"
 
-    # sdpa -- F.scaled_dot_product_attention.
-    # math -- the baseline's explicit attention, kept for bisecting numerics.
+    # sdpa   -- F.scaled_dot_product_attention.
+    # triton -- the pass-3 FlashAttention-2-style kernel (kernels.py);
+    #           measured slower than sdpa on the T4, kept as an experiment.
+    #           Falls back to sdpa off the dense-fp16 supported envelope.
+    # math   -- the baseline's explicit attention, kept for bisecting numerics.
     attention: str = "sdpa"
 
     # Force a specific SDPA backend. "auto" lets PyTorch choose; on sm_75 that
@@ -579,7 +591,27 @@ class OptimizedTransformer(BaselineTransformer):
                 seq_len,
             )
 
-        if self.settings.attention == "sdpa":
+        if (
+            self.settings.attention == "triton"
+            and attn_allow is None
+            and kernels.attention_supported(self.head_dim, q.dtype, q.device)
+        ):
+            # Pass-3 experimental kernel. It writes [B, S, H*hd] directly, so
+            # the transpose+reshape pass before the output projection
+            # disappears; q/k/v are consumed through their strides with no
+            # .contiguous() copies.
+            context = kernels.flash_attention(
+                q, k, v, self.attn_scale, use_is_causal
+            )
+            return F.linear(
+                context, layer_weights.out_weight, layer_weights.out_bias
+            )
+
+        if self.settings.attention == "math":
+            context = self._math_attention(q, k, v, attn_allow, use_is_causal)
+        else:
+            # "sdpa", and the fallback whenever "triton" is off its envelope
+            # (padding mask, non-fp16 dtype, unsupported head_dim, no triton).
             with _sdpa_backend(self.settings.sdpa_backend):
                 context = F.scaled_dot_product_attention(
                     q,
@@ -590,8 +622,6 @@ class OptimizedTransformer(BaselineTransformer):
                     is_causal=use_is_causal,
                     scale=self.attn_scale,
                 )
-        else:
-            context = self._math_attention(q, k, v, attn_allow, use_is_causal)
 
         context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
         return F.linear(context, layer_weights.out_weight, layer_weights.out_bias)
