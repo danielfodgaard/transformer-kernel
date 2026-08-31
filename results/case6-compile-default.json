@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-31T05:01:37+0000",
+  "passthrough_args": [
+    "--compile-user",
+    "--compile-mode",
+    "default"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp32_reductions=False cuda_graphs=False"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 6,
+        "batch_size": 10000,
+        "d_model": 128,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 128,
+        "group": "batch"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "10000",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "128",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "128",
+        "--layers",
+        "4",
+        "--causal",
+        "--compile-user",
+        "--compile-mode",
+        "default"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 552.05,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True fused_norm=True assume_dense_mask=False fp16_min_d_model=64 fp32_reductions=False cuda_graphs=False",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.00199521,
+        "max_relative_error": 256595000.0,
+        "failed_elements": 0,
+        "total_elements": 819200000
+      },
+      "baseline": {
+        "median_ms": 1459.0204,
+        "mean_ms": 1458.8859,
+        "p90_ms": 1460.8968,
+        "min_ms": 1440.056,
+        "tokens_per_second": 877300.97
+      },
+      "optimized": {
+        "median_ms": 198.8146,
+        "mean_ms": 198.855,
+        "p90_ms": 200.0123,
+        "min_ms": 193.8501,
+        "tokens_per_second": 6438158.54
+      },
+      "speedup": 7.339
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "config": {
+    "batch_size": 32,
+    "seq_len": 4096,
+    "d_model": 1024,
+    "heads": 16,
+    "layers": 2,
+    "ffn_dim": 1024,
+    "chunk_size": 2,
+    "reference_chunk_size": 1,
+    "max_samples": 4,
+    "skip_accuracy": false,
+    "skip_proxy": false,
+    "proxy_seq_len": 1024,
+    "proxy_batch_size": 8,
+    "warmup": 1,
+    "repeats": 3,
+    "rtol": 0.02,
+    "atol": 0.002,
+    "seed": 1234,
+    "out": "results/case14-dry.json"
+  },
+  "gpu": "Tesla T4",
+  "proxy_ok": true,
+  "accuracy": {
+    "max_abs": 0.0008473396301269531,
+    "max_rel": 3502.58642578125,
+    "failed": 0,
+    "total": 16777216,
+    "passed": true
+  },
+  "timing": {
+    "median_ms": 431.0241394042969,
+    "samples_ms": [
+      431.0241394042969,
+      429.5807800292969,
+      434.925537109375
+    ],
+    "tokens_per_second": 304094.33722470846
+  }
+}

@@ -39,10 +39,15 @@ I picked the **PyTorch** track.
 | Path | Description |
 | --- | --- |
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
-| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream. |
+| `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream, fused Triton residual+LayerNorm kernels on the dense path. |
+| `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
+| `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
+| `src/run_case14.py` | Out-of-core runner for appendix case 14, which the official harness cannot grade on any hardware. Chunked fp16 candidate vs a chunked fp32 proxy reference, validated against the true baseline at a feasible sequence length. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
+| `src/dispatch.py` | Data-driven shape dispatch: scans `results/*.json`, keeps the fastest accuracy-passing settings per shape, and writes `configs/dispatch.json`; `run_case.py --dispatch` applies it. |
 | `configs/shapes.json` | The 14 appendix test shapes. |
+| `configs/best.json` | The appendix shapes annotated with the best-known harness-level flags per case (compile everywhere except case 6). |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
 
 The upstream script was last updated 27 August 2026. It is kept byte-identical
@@ -65,8 +70,18 @@ Sweep every appendix shape and write the numbers to `results/`:
 python src/sweep.py --skip 14 --out results/pass1-fp16.json
 ```
 
-Case 14 is skipped because it does not fit on a 16 GB GPU — see
-`docs/pass1-decisions.md`. Anything after `--` is forwarded to the run, so
+Case 14 is skipped because the *baseline* cannot run it anywhere: its
+materialized `[32, 16, 100000, 100000]` score tensor is ~20 TB, and the fp32
+input activation alone is 13.1 GB on a 15 GB T4 — see
+`docs/pass1-decisions.md`. The optimized path *can* run it; `run_case14.py`
+does so out of core and grades it against a validated fp32 proxy reference:
+
+```bash
+python src/run_case14.py --max-samples 4   # quick read (~a few minutes)
+python src/run_case14.py                   # full accuracy pass + timing
+```
+
+Anything after `--` is forwarded to the run, so
 precision modes and `torch.compile` are reachable from the sweep:
 
 ```bash
@@ -241,10 +256,37 @@ CUDA-graph region, and graph replays overwrote them
 are now wrapped in `torch.compiler.disable`; the compiled table above is the
 post-fix re-measurement.
 
+### Pass two, measured (fused Triton kernels + CUDA graphs)
+
+Pass two turns on the fused Triton residual+LayerNorm kernels by default and
+adds manual CUDA-graph capture (`--cuda-graphs`). Measured best configuration
+per case (`results/pass2-default.json`, `results/pass2-cg.json`; CUDA graphs
+on the launch-bound cases 1–4 and 12, plain defaults elsewhere):
+
+| # | Pass-1 best | Pass-2 best | Optimized ms | Config |
+| --- | --- | --- | --- | --- |
+| 1 | 6.00x | **7.05x** | 1.42 | cuda-graphs |
+| 2 | 4.20x | **9.55x** | 0.30 | cuda-graphs |
+| 3 | 4.11x | **9.19x** | 0.31 | cuda-graphs |
+| 4 | 3.92x | **6.64x** | 0.43 | cuda-graphs |
+| 5 | 6.54x | **6.98x** | 2.66 | default |
+| 6 | 3.65x | **7.35x** | 198.57 | default |
+| 7 | 7.39x | 3.93x | 1.60 | default (fp32 dispatch: max_abs 1.2e-06) |
+| 8 | 5.10x | 5.09x | 25.23 | default |
+| 9 | 4.05x | **4.43x** | 1.43 | default |
+| 10 | 4.97x | **5.24x** | 1.50 | default |
+| 11 | 8.91x | **10.19x** | 2.18 | default |
+| 12 | 4.11x | **6.95x** | 0.42 | cuda-graphs |
+| 13 | 16.32x | **16.98x** | 18.75 | default |
+
+Geometric mean: **7.11x** (was 5.52x). Case 7's drop is the deliberate
+accuracy trade — its fp16 margin failed a 25-trial stress, so it runs fp32.
+All 13 cases pass accuracy; case 14 additionally passes out-of-core (below).
+
 ## Status
 
-Pass one is implemented and measured (table above). The optimizations in
-`src/optimized.py` are PyTorch-level only: fused Q/K/V projection,
+Pass two is implemented and measured (tables above). The pass-one
+optimizations that table measures are PyTorch-level only: fused Q/K/V projection,
 `scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
 tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
 LayerNorm statistics and softmax accumulation left in fp32, and the per-layer
@@ -252,17 +294,36 @@ causal mask hoisted out of the layer loop.
 
 ## Limitations and next steps
 
-- No custom Triton or CUDA kernel yet — pass one is deliberately PyTorch-level.
-  A fused LayerNorm+residual Triton kernel is the next planned step.
-- Case 6 cannot use CUDA graphs on a 16 GB card while the baseline shares the
-  device; `--compile-mode default` (fusion without graph pools) is untested
-  and might recover part of the gap.
-- The d32 fp32 dispatch and the compiled-fp32 case 7 number need a
-  verification run (`configs/best.json` sweep).
-- Accuracy margins are extreme-value statistics; only case 7 has been
-  stress-tested beyond the official 5 trials so far.
-- Appendix case 14 (batch 32 × seq 100 000 × `d_model` 1024) does not fit on a
-  T4 in either implementation: the fp32 input activation alone is 13.1 GB and
-  the baseline's per-sample score tensor would be 640 GB, so the reference is
-  uncomputable on any hardware. Our path needs sequential batch chunking;
-  validation methodology is an open question for the organisers.
+- The Triton kernels earn their place: `--no-fused-norm` costs case 1
+  1.40→2.62 ms, case 5 2.66→5.27 ms, case 13 18.8→28.2 ms.
+- Manual `--cuda-graphs` beats `torch.compile reduce-overhead` on every
+  launch-bound shape (0.30–0.43 ms vs 0.54–0.57 ms replay latency) and
+  compile beats the plain defaults nowhere now that the Triton kernels cover
+  the elementwise fusion — the best configuration no longer uses
+  `torch.compile` at all.
+- `--fp32-reductions` measured **no effect** on either accuracy (identical
+  max_abs on case 6) or speed (case 8 within noise) — cuBLAS was evidently
+  not using fp16 reductions on this stack to begin with. Kept only as a
+  probe.
+- **Case 6 fails a 25-trial stress** (max_abs 0.00208, 1 element of 4.1B)
+  while passing the official 5-trial run at 0.00187. Same extreme-value
+  mechanism as case 7, but the fp32 hammer would cost most of case 6's 7.3x,
+  so the default stays fp16 with the fragility documented;
+  `--fp16-max-elements 100000000` dispatches oversized forwards to fp32 for
+  seed-robustness at that price (cost not yet measured).
+- Case 6 and compile: `reduce-overhead` OOMs beside the baseline at batch
+  10000, and `--compile-mode default` measured no gain over the fused
+  defaults (7.34x vs 7.35x). It runs plain defaults.
+- **Case 14 runs and passes**: chunked fp16 vs the validated fp32 proxy
+  reference over all 3.28B output elements, max_abs 0.00102, zero failures,
+  155.4 s per forward (`results/case14-full.json`). The official harness
+  still cannot grade it anywhere (the baseline reference is uncomputable);
+  methodology question for the organisers stands.
+- A fused attention kernel for the degenerate `head_dim=8` shape (appendix
+  case 11) is the natural next kernel.
+- Shape-specialised dispatch is data-driven rather than hand-written: after
+  sweeping settings variants, `python src/dispatch.py` distills the fastest
+  accuracy-passing configuration per appendix shape into
+  `configs/dispatch.json`, and `--dispatch` applies it (explicit flags still
+  win; the in-model d32→fp32 dispatch applies regardless). `configs/best.json`
+  is the hand-written equivalent for the harness-level flags.
