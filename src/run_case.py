@@ -10,7 +10,9 @@ Every flag the benchmark defines still works and is passed straight through;
 the flags added here all control the optimized implementation:
 
     --precision {fp16,autocast,fp32}   how the matmuls are run
-    --attention {sdpa,math}            fused SDPA or the baseline's attention
+    --attention {sdpa,triton,math}     SDPA, the experimental pass-3 Triton
+                                       flash kernel (measured slower on T4),
+                                       or the baseline's attention
     --sdpa-backend {auto,efficient,math,flash}
     --no-fuse-qkv                      keep three separate Q/K/V matmuls
     --no-fused-norm                    eager residual+LayerNorm chain instead
@@ -74,7 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precision", choices=("fp16", "autocast", "fp32"), default="fp16"
     )
-    parser.add_argument("--attention", choices=("sdpa", "math"), default="sdpa")
+    parser.add_argument(
+        "--attention", choices=("sdpa", "triton", "math"), default="sdpa"
+    )
     parser.add_argument(
         "--sdpa-backend",
         choices=("auto", "efficient", "math", "flash"),
