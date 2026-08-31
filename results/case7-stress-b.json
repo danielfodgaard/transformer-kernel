@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "config": "appendix",
+  "generated_at": "2026-08-31T04:08:18+0000",
+  "passthrough_args": [
+    "--accuracy-trials",
+    "25",
+    "--seed",
+    "9999"
+  ],
+  "environment": {
+    "gpu": "Tesla T4",
+    "torch": "2.10.0+cu128",
+    "device": "cuda",
+    "dtype": "torch.float32",
+    "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True assume_dense_mask=False"
+  },
+  "cases": [
+    {
+      "case": {
+        "id": 7,
+        "batch_size": 64,
+        "d_model": 32,
+        "heads": 4,
+        "seq_len": 128,
+        "layers": 4,
+        "causal": true,
+        "ffn_dim": 32,
+        "group": "width"
+      },
+      "command": [
+        "/usr/bin/python3",
+        "/kaggle/working/transformer-kernel/src/run_case.py",
+        "--batch-size",
+        "64",
+        "--seq-len",
+        "128",
+        "--d-model",
+        "32",
+        "--heads",
+        "4",
+        "--ffn-dim",
+        "32",
+        "--layers",
+        "4",
+        "--causal",
+        "--accuracy-trials",
+        "25",
+        "--seed",
+        "9999"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "wall_seconds": 6.91,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "torch": "2.10.0+cu128",
+      "gpu": "Tesla T4",
+      "optimizer": "precision=fp16 attention=sdpa sdpa_backend=auto fuse_qkv=True assume_dense_mask=False",
+      "accuracy": {
+        "passed": true,
+        "max_abs_error": 0.001737,
+        "max_relative_error": 1925.73,
+        "failed_elements": 0,
+        "total_elements": 6553600
+      },
+      "baseline": {
+        "median_ms": 6.4306,
+        "mean_ms": 6.425,
+        "p90_ms": 6.4848,
+        "min_ms": 6.2565,
+        "tokens_per_second": 1273904.37
+      },
+      "optimized": {
+        "median_ms": 1.3578,
+        "mean_ms": 1.5115,
+        "p90_ms": 1.9334,
+        "min_ms": 1.2635,
+        "tokens_per_second": 6033182.65
+      },
+      "speedup": 4.736
+    }
+  ]
+}

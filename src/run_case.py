@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
+    parser.add_argument("--fp16-min-d-model", type=int, default=64)
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
@@ -87,6 +88,7 @@ def main() -> int:
             sdpa_backend=args.sdpa_backend,
             fuse_qkv=not args.no_fuse_qkv,
             assume_dense_mask=args.assume_dense_mask,
+            fp16_min_d_model=args.fp16_min_d_model,
         )
         bench.UserOptimizedTransformer = optimized.OptimizedTransformer
         print(
@@ -95,7 +97,8 @@ def main() -> int:
             f"attention={settings.attention} "
             f"sdpa_backend={settings.sdpa_backend} "
             f"fuse_qkv={settings.fuse_qkv} "
-            f"assume_dense_mask={settings.assume_dense_mask}"
+            f"assume_dense_mask={settings.assume_dense_mask} "
+            f"fp16_min_d_model={settings.fp16_min_d_model}"
         )
 
     return bench.main()
