@@ -146,7 +146,9 @@ def case_command(case: Dict, passthrough: List[str]) -> List[str]:
     ]
     if case.get("causal"):
         command.append("--causal")
-    return command + passthrough
+    # Global passthrough first, then the case's own extra_args so a per-shape
+    # config (e.g. configs/best.json) can specialize flags per case.
+    return command + passthrough + list(case.get("extra_args", []))
 
 
 def classify(returncode: int, parsed: Dict, timed_out: bool) -> str:

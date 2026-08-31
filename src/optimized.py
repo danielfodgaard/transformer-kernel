@@ -109,6 +109,13 @@ class OptimizerSettings:
     # used regardless of this setting.
     fused_norm: bool = True
 
+    # Shape dispatch: models narrower than this stay in fp32 even when
+    # precision=fp16. Measured on a T4 with d_model=32 (appendix case 7), the
+    # fp16 path's worst-element error reached 0.00208 across 25 accuracy
+    # trials -- over the 0.002 absolute budget -- while fp32 sits at ~2e-6
+    # and still keeps the structural speedups. 0 disables the dispatch.
+    fp16_min_d_model: int = 64
+
 
 _ACTIVE = OptimizerSettings()
 
@@ -225,6 +232,8 @@ class OptimizedTransformer(BaselineTransformer):
             return None
         if not x.is_cuda:
             return None
+        if 0 < self.settings.fp16_min_d_model and self.d_model < self.settings.fp16_min_d_model:
+            return None  # narrow model: fp16 error exceeds the abs budget
         if x.dtype in (torch.float16, torch.bfloat16):
             return None  # already reduced precision; leave it alone
         return torch.float16

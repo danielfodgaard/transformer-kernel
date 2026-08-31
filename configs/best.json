@@ -1,0 +1,222 @@
+{
+  "name": "best",
+  "description": "The appendix shapes with the best-known per-case configuration on a Tesla T4. Compiled with CUDA graphs (--compile-mode reduce-overhead) everywhere except case 6: at batch 10000 the CUDA-graph private pools (~2.8GB) plus the baseline's ~10GB of transient fp32 score tensors exceed the T4's 14.6GB, so case 6 runs eager (see results/pass2-fp16-compiled.json). Case 7's fp32 dispatch is inside the model (fp16_min_d_model=64), not a flag. Run: python src/sweep.py --config configs/best.json --skip 14",
+  "cases": [
+    {
+      "id": 1,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "reference",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 2,
+      "batch_size": 1,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "batch",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 3,
+      "batch_size": 4,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "batch",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 4,
+      "batch_size": 16,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "batch",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 5,
+      "batch_size": 128,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "batch",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 6,
+      "batch_size": 10000,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "batch",
+      "note": "Runs eager: compiled reduce-overhead OOMs because the CUDA-graph private pools do not fit beside the baseline's transient score tensors at batch 10000."
+    },
+    {
+      "id": 7,
+      "batch_size": 64,
+      "d_model": 32,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 32,
+      "group": "width",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 8,
+      "batch_size": 64,
+      "d_model": 1024,
+      "heads": 4,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 1024,
+      "group": "width",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 9,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 1,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "heads",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 10,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 2,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "heads",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 11,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 16,
+      "seq_len": 128,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "heads",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 12,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 32,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "seq",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 13,
+      "batch_size": 64,
+      "d_model": 128,
+      "heads": 4,
+      "seq_len": 1024,
+      "layers": 4,
+      "causal": true,
+      "ffn_dim": 128,
+      "group": "seq",
+      "extra_args": [
+        "--compile-user",
+        "--compile-mode",
+        "reduce-overhead"
+      ]
+    },
+    {
+      "id": 14,
+      "batch_size": 32,
+      "d_model": 1024,
+      "heads": 16,
+      "seq_len": 100000,
+      "layers": 2,
+      "causal": true,
+      "ffn_dim": 1024,
+      "group": "seq",
+      "note": "Infeasible on a 15GB T4: the fp32 activation alone is 32*100000*1024*4 = 13.1GB, and the baseline additionally materializes a [32,16,100000,100000] score tensor. Needs batch chunking; expected to OOM in pass one."
+    }
+  ]
+}

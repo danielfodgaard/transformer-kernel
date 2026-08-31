@@ -77,7 +77,9 @@ FLAG_TO_FIELD = {
     "--attention": "attention",
     "--sdpa-backend": "sdpa_backend",
     "--no-fuse-qkv": "fuse_qkv",
+    "--no-fused-norm": "fused_norm",
     "--assume-dense-mask": "assume_dense_mask",
+    "--fp16-min-d-model": "fp16_min_d_model",
 }
 
 

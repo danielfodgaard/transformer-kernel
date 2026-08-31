@@ -58,6 +58,7 @@ EXTRA_FLAGS = (
     "--no-fuse-qkv",
     "--no-fused-norm",
     "--assume-dense-mask",
+    "--fp16-min-d-model",
     "--fp32-reductions",
     "--cuda-graphs",
     "--dispatch",
@@ -80,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
     parser.add_argument("--no-fused-norm", action="store_true")
+    parser.add_argument("--fp16-min-d-model", type=int, default=64)
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--fp32-reductions", action="store_true")
     parser.add_argument("--cuda-graphs", action="store_true")
@@ -158,6 +160,7 @@ def main() -> int:
             fuse_qkv=not args.no_fuse_qkv,
             fused_norm=not args.no_fused_norm,
             assume_dense_mask=args.assume_dense_mask,
+            fp16_min_d_model=args.fp16_min_d_model,
         )
         if dispatch_overrides:
             settings = optimized.configure(**dispatch_overrides)
@@ -180,6 +183,7 @@ def main() -> int:
             f"fuse_qkv={settings.fuse_qkv} "
             f"fused_norm={settings.fused_norm} "
             f"assume_dense_mask={settings.assume_dense_mask} "
+            f"fp16_min_d_model={settings.fp16_min_d_model} "
             f"fp32_reductions={args.fp32_reductions} "
             f"cuda_graphs={args.cuda_graphs}"
         )
