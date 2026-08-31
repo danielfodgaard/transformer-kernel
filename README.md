@@ -41,7 +41,9 @@ I picked the **PyTorch** track.
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
 | `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream, fused Triton residual+LayerNorm kernels on the dense path. |
 | `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
+| `src/kernels.py` | Experimental FlashAttention-2-style Triton forward for sm_75 (`--attention triton`). Measured slower than SDPA on the T4 — kept as a documented negative result; see the pass-3 section. |
 | `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
+| `src/test_triton_kernels.py` | Pytest twin of the above covering `fused_kernels.py` and `kernels.py`; runs on a GPU or CPU-only via `TRITON_INTERPRET=1` (Triton's numpy interpreter). |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/run_case14.py` | Out-of-core runner for appendix case 14, which the official harness cannot grade on any hardware. Chunked fp16 candidate vs a chunked fp32 proxy reference, validated against the true baseline at a feasible sequence length. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
@@ -49,6 +51,8 @@ I picked the **PyTorch** track.
 | `configs/shapes.json` | The 14 appendix test shapes. |
 | `configs/best.json` | The appendix shapes annotated with the best-known harness-level flags per case (compile everywhere except case 6). |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
+| `docs/pass3-research.md` | Research survey (what current attention-kernel work does and doesn't transfer to sm_75), per-regime bottleneck analysis, attention-kernel design record, and the measured addendum. |
+| `notebooks/pass3-t4.ipynb` | Kaggle notebook: kernel tests on the T4, best-config regression, and the pass-3 follow-up measurements. |
 
 The upstream script was last updated 27 August 2026. It is kept byte-identical
 to what the organisers shipped; for submission the body of `OptimizedTransformer`
@@ -96,6 +100,15 @@ python src/run_case.py --causal --batch-size 64 --d-model 128 \
   --heads 4 --seq-len 128 --layers 4 --ffn-dim 128
 
 python src/run_case.py --precision autocast --compile-user
+```
+
+Kernel numerics tests — the script needs a GPU, the pytest suite also runs
+CPU-only through Triton's interpreter:
+
+```bash
+python src/test_kernels.py                            # GPU
+pytest src/test_triton_kernels.py                     # GPU
+TRITON_INTERPRET=1 pytest src/test_triton_kernels.py  # CPU-only machine
 ```
 
 The stock baseline-vs-baseline harness still runs on its own:
@@ -283,14 +296,62 @@ Geometric mean: **7.11x** (was 5.52x). Case 7's drop is the deliberate
 accuracy trade — its fp16 margin failed a 25-trial stress, so it runs fp32.
 All 13 cases pass accuracy; case 14 additionally passes out-of-core (below).
 
+### Pass three, measured (independent cross-check + attention-kernel experiment)
+
+A separate session built the same fused residual+LayerNorm design
+independently, plus a FlashAttention-2-style Triton attention kernel for
+sm_75, and measured both on another Kaggle T4 **before** this branch and the
+pass-2 integration merged (raw data: `results/pass3-e*.json`; kernel design:
+`docs/pass3-research.md`). Two independent implementations of the LN fusion
+converging on the same win is the strongest evidence in this repo that the
+win is real; the merged tree ships the pass-2 `fused_kernels.py`
+implementation and keeps the attention kernel as an opt-in experiment.
+
+What that session measured:
+
+- **Fused-LN eager confirmation (E1)** — case 1 6.06x, case 5 6.10x,
+  case 6 5.30x, case 13 14.5x, agreeing in direction and rough magnitude
+  with the pass-2 table (6.79x / 6.98x / 7.35x / 16.98x). The residual gap
+  is cross-session spread plus one real difference since fixed: that branch
+  still paid an uncached per-forward mask sync, which stalls kernel-launch
+  overlap exactly as the `_mask_is_dense` docstring describes.
+- **The Triton attention kernel loses everywhere (E2)** — `--attention
+  triton` eager: case 1 8.21 ms, case 5 16.3 ms, case 9 4.52 ms, case 11
+  7.47 ms, case 13 187 ms — versus 2.4–3.5 ms / 28.8 ms class numbers on the
+  SDPA path. The CUTLASS memory-efficient kernel keeps its crown on sm_75;
+  hypotheses (no `cp.async` for Triton's pipeliner, `exp` vs `exp2`,
+  conservative tiles) are recorded in `src/kernels.py`. The kernel stays
+  in-tree as a documented negative result answering "a fused attention
+  kernel is the natural next kernel" — with data.
+- **Case 6 via `--compile-mode default` (E3)** — 6.25x on that branch;
+  independently confirms the pass-2 conclusion that compile adds nothing
+  over the fused defaults on case 6.
+- **Triton kernels inside `reduce-overhead` compile (E4)** — mixed to
+  negative (case 12 regressed to 0.85x); the idea is dropped from the
+  merged flag surface.
+- **Case 7 dispatch verification (E5)** — 25-trial stress now passes at
+  max_abs 1.2e-06 with the shipped `fp16_min_d_model=64` dispatch (the
+  pre-dispatch failure was 0.00208). Compiled `reduce-overhead` measured
+  1.46 ms for case 7 vs 1.60 ms plain-default in the pass-2 session — a
+  cross-session hint worth one head-to-head, queued in the notebook.
+- **25-trial × 2-seed stress, all cases (E6)** — every case except 6 passes
+  both seeds with margin (worst max_abs ≈ 1.7e-3); **case 6 fails seed 1234
+  outright at 0.002074** and reaches 0.0022 on seed 9999 (that element was
+  saved by the relative criterion). This independently reproduces the
+  fragility documented below: case 6's fp16 margin does not survive trial
+  scaling.
+
 ## Status
 
-Pass two is implemented and measured (tables above). The pass-one
-optimizations that table measures are PyTorch-level only: fused Q/K/V projection,
-`scaled_dot_product_attention` in place of a materialised `[B, H, S, S]` score
-tensor, fp16 matmuls on the T4's tensor cores with the residual stream,
-LayerNorm statistics and softmax accumulation left in fp32, and the per-layer
-causal mask hoisted out of the layer loop.
+Passes one to three are implemented and measured (tables above): fused Q/K/V
+projection, `scaled_dot_product_attention` in place of a materialised
+`[B, H, S, S]` score tensor, fp16 matmuls on the T4's tensor cores with an
+fp32 residual stream, fused Triton residual+LayerNorm kernels on by default,
+manual CUDA-graph capture for the launch-bound shapes, the d<64 fp32
+dispatch, out-of-core case 14 — plus, from pass three, an experimental
+Triton attention kernel kept as a measured negative result, an
+interpreter-runnable kernel test suite, and an independent cross-check of
+the pass-2 numbers from a second T4 session.
 
 ## Limitations and next steps
 
@@ -306,11 +367,13 @@ causal mask hoisted out of the layer loop.
   not using fp16 reductions on this stack to begin with. Kept only as a
   probe.
 - **Case 6 fails a 25-trial stress** (max_abs 0.00208, 1 element of 4.1B)
-  while passing the official 5-trial run at 0.00187. Same extreme-value
+  while passing the official 5-trial run at 0.00187 — now reproduced on a
+  second seed and session (pass-3 E6: 0.002074 fail on seed 1234, 0.0022 on
+  seed 9999 saved only by the relative criterion). Same extreme-value
   mechanism as case 7, but the fp32 hammer would cost most of case 6's 7.3x,
   so the default stays fp16 with the fragility documented;
   `--fp16-max-elements 100000000` dispatches oversized forwards to fp32 for
-  seed-robustness at that price (cost not yet measured).
+  seed-robustness at that price (cost measurement queued in the notebook).
 - Case 6 and compile: `reduce-overhead` OOMs beside the baseline at batch
   10000, and `--compile-mode default` measured no gain over the fused
   defaults (7.34x vs 7.35x). It runs plain defaults.
@@ -319,8 +382,14 @@ causal mask hoisted out of the layer loop.
   155.4 s per forward (`results/case14-full.json`). The official harness
   still cannot grade it anywhere (the baseline reference is uncomputable);
   methodology question for the organisers stands.
-- A fused attention kernel for the degenerate `head_dim=8` shape (appendix
-  case 11) is the natural next kernel.
+- The fused attention kernel for the degenerate `head_dim=8` shape was
+  built and measured in pass three: it **loses to the CUTLASS SDPA kernel
+  on every appendix shape** (case 11: 7.47 ms vs 3.47 ms eager). It stays
+  in-tree behind `--attention triton` as a documented negative result;
+  future tuning directions (exp2 softmax, tile/warp retuning, single-phase
+  causal loop) are listed in `src/kernels.py`. Case 7 compiled
+  `reduce-overhead` (1.46 ms vs 1.60 ms default, cross-session) is the one
+  open head-to-head; both are in `notebooks/pass3-t4.ipynb`.
 - Shape-specialised dispatch is data-driven rather than hand-written: after
   sweeping settings variants, `python src/dispatch.py` distills the fastest
   accuracy-passing configuration per appendix shape into
