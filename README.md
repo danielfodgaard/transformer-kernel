@@ -52,6 +52,8 @@ I picked the **PyTorch** track.
 | `configs/best.json` | The appendix shapes annotated with the best-known harness-level flags per case (compile everywhere except case 6). |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
 | `docs/pass3-research.md` | Research survey (what current attention-kernel work does and doesn't transfer to sm_75), per-regime bottleneck analysis, attention-kernel design record, and the measured addendum. |
+| `docs/devpost.md` | The Devpost project description, ready to paste: problem fit, tools, APIs, libraries, datasets. |
+| `docs/video-script.md` | Shot-by-shot script for the demo video (commands, narration, compliance checklist). |
 | `notebooks/pass3-t4.ipynb` | Kaggle notebook: kernel tests on the T4, best-config regression, and the pass-3 follow-up measurements. |
 
 The upstream script was last updated 27 August 2026. It is kept byte-identical
@@ -63,7 +65,7 @@ is pasted into the `UserOptimizedTransformer` stub.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch          # CUDA build matching your GPU — see pytorch.org
+pip install torch pytest   # torch: CUDA build matching your GPU — see pytorch.org
 ```
 
 ## Reproducing the results
@@ -157,15 +159,32 @@ python src/torch_transformer_benchmark.py --causal \
 
 ## Deliverables
 
-- **Devpost project description** — how the solution addresses the problem, plus
-  dev tools, APIs, libraries, and datasets used.
-- **This public repository** — commented code and a README covering the project
-  overview, setup, reproduction steps, limitations, and contributions.
-- **Demo video** — a short public YouTube walkthrough linked from Devpost.
-  A walkthrough of API usage, inference examples, and result analysis is
-  acceptable for a backend track like this one.
-- **Tech report** — the environment (CPU, GPU, disk), the optimisations applied,
-  the AI skills and tools used, and the final test results.
+- **Devpost project description** — written and ready to paste:
+  [`docs/devpost.md`](docs/devpost.md) (problem fit, development tools,
+  APIs, libraries/frameworks, datasets/assets).
+- **This public repository** — overview (top of this file), setup and
+  reproduction steps (above), limitations and what more time would buy
+  (below), contributions (below).
+- **Demo video** — public YouTube walkthrough of inference runs and result
+  analysis (the accepted backend-track format). Recording plan:
+  [`docs/video-script.md`](docs/video-script.md). Link: _to be added after
+  recording_.
+- **Tech report** — the environment, optimisations, AI tooling, and final
+  results are covered by this README's results sections plus
+  `docs/pass1-decisions.md` and `docs/pass3-research.md`.
+
+## Contributions
+
+Solo entry by **Daniel Fodgaard**, built AI-assisted — which the problem
+statement places explicitly in scope ("AI-assisted code generation").
+
+- **Daniel** — project direction, every GPU measurement run (Kaggle T4
+  sessions; no number in this repo was produced unattended), review and
+  merge decisions on each pass, and the final submission.
+- **Claude Code (Anthropic)** — implementation of the optimisation passes,
+  Triton kernels, test suites, measurement analysis, and documentation,
+  across multiple sessions; each commit links the session that produced it
+  in its trailer, so the AI-assisted history is auditable end to end.
 
 ## Judging criteria
 
@@ -354,6 +373,8 @@ interpreter-runnable kernel test suite, and an independent cross-check of
 the pass-2 numbers from a second T4 session.
 
 ## Limitations and next steps
+
+What the solution does not do, and what more time would improve:
 
 - The Triton kernels earn their place: `--no-fused-norm` costs case 1
   1.40→2.62 ms, case 5 2.66→5.27 ms, case 13 18.8→28.2 ms.
