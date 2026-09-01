@@ -40,10 +40,15 @@ I picked the **PyTorch** track.
 | --- | --- |
 | `src/torch_transformer_benchmark.py` | The organisers' benchmark harness, **unmodified**. Contains `BaselineTransformer`, the `UserOptimizedTransformer` stub, the accuracy comparison, and the latency benchmark. |
 | `src/optimized.py` | The optimized implementation. Subclasses `BaselineTransformer`; fused QKV projection, `scaled_dot_product_attention`, fp16 matmuls with an fp32 residual stream, fused Triton residual+LayerNorm kernels on the dense path. |
-| `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast and fused residual-add+LayerNorm+cast, statistics in fp32. |
+| `src/fused_kernels.py` | Custom Triton kernels: fused LayerNorm+cast, fused residual-add+LayerNorm+cast (statistics in fp32; the dead final residual store is skipped since pass 4), and the pass-4 fused causal softmax backing `--attention bmm`. |
+| `src/gemm_kernels.py` | Pass-4 fused Triton GEMM epilogues (opt-in): GEMM+bias+residual+LayerNorm for out_proj/ffn_out (`--fused-out-proj`, `--fused-ffn`) and GEMM+bias+erf-GELU for ffn_in. |
+| `src/dual_gpu.py` | Pass-4 opt-in batch-split data parallelism for 2x-T4 environments (`--dual-gpu`): stream/event choreography that keeps the harness's cuda:0 event timing sound with zero host syncs; numerics element-identical to single-GPU. An environment extension, never the submission path. |
 | `src/kernels.py` | Experimental FlashAttention-2-style Triton forward for sm_75 (`--attention triton`). Measured slower than SDPA on the T4 — kept as a documented negative result; see the pass-3 section. |
-| `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end). Run it before sweeping with the fused path on. |
-| `src/test_triton_kernels.py` | Pytest twin of the above covering `fused_kernels.py` and `kernels.py`; runs on a GPU or CPU-only via `TRITON_INTERPRET=1` (Triton's numpy interpreter). |
+| `src/profile_case.py` | Per-op CUDA time attribution for one shape (steady-state, past graph capture) — replaces inferred kernel inventories with measurements. |
+| `src/bench_micro.py` | Isolated microbenchmarks: cuBLAS GEMM TFLOPS, the SDPA head_dim cliff, the bmm-attention chain, and cuda:0<->cuda:1 P2P bandwidth. |
+| `src/test_kernels.py` | GPU numerics test for the Triton kernels (unit level and fused-vs-eager end to end), pass-4 kernels included. Run it before sweeping with the fused paths on. |
+| `src/test_triton_kernels.py` | Pytest twin of the above covering `fused_kernels.py`, `gemm_kernels.py` and `kernels.py`; runs on a GPU or CPU-only via `TRITON_INTERPRET=1` (Triton's numpy interpreter). |
+| `src/test_dual_gpu.py` | Dual-GPU wrapper tests: no-op transparency off the envelope, eligibility gates, split clamping (CPU-runnable), plus the real two-GPU equivalence test (runs in the notebook gate). |
 | `src/run_case.py` | Runs the harness with `UserOptimizedTransformer` swapped for ours, so the organisers' file stays untouched. All of its flags pass through. |
 | `src/run_case14.py` | Out-of-core runner for appendix case 14, which the official harness cannot grade on any hardware. Chunked fp16 candidate vs a chunked fp32 proxy reference, validated against the true baseline at a feasible sequence length. |
 | `src/sweep.py` | Runs a set of shapes (one subprocess each) and writes the numbers to `results/*.json`. |
@@ -51,8 +56,10 @@ I picked the **PyTorch** track.
 | `configs/shapes.json` | The 14 appendix test shapes. |
 | `configs/best.json` | The appendix shapes annotated with the best-known harness-level flags per case (compile everywhere except case 6). |
 | `docs/pass1-decisions.md` | Why each optimisation was chosen, what stays in fp32, and how to bisect an accuracy failure. |
-| `docs/pass3-research.md` | Research survey (what current attention-kernel work does and doesn't transfer to sm_75), per-regime bottleneck analysis, attention-kernel design record, and the measured addendum. |
-| `notebooks/pass3-t4.ipynb` | Kaggle notebook: kernel tests on the T4, best-config regression, and the pass-3 follow-up measurements. |
+| `docs/pass3-research.md` | Research survey (what current attention-kernel work does and doesn't transfer to sm_75), per-regime bottleneck analysis, attention-kernel design record, and the measured addendum. Carries a pass-4 erratum on the SDPA output layout. |
+| `docs/pass4-plan.md` | Pass-4 design record: dual-GPU split, GEMM-epilogue fusion, the case-8 bmm attention dispatch, riders, the rejected-with-arithmetic list, and the pre-registered decision rules for the measurement session. |
+| `notebooks/pass3-t4.ipynb` | Kaggle notebook: kernel tests on the T4, best-config regression, and the pass-3 follow-up measurements. **Superseded by `pass4-t4.ipynb`** — its F1–F4 cells never ran (the branch it checks out was deleted when pass 3 merged) and are carried forward there. |
+| `notebooks/pass4-t4.ipynb` | Kaggle 2x-T4 notebook: gate (kernel tests, P2P bandwidth, SDPA-layout probe), the pass-4 experiment matrix G1–G5, and the inherited F1–F4 backlog. |
 
 The upstream script was last updated 27 August 2026. It is kept byte-identical
 to what the organisers shipped; for submission the body of `OptimizedTransformer`
@@ -341,6 +348,38 @@ What that session measured:
   fragility documented below: case 6's fp16 margin does not survive trial
   scaling.
 
+### Pass four, implemented — measurement pending (Kaggle 2x T4)
+
+Pass four is implemented and locally validated (interpreter kernel tests +
+end-to-end CPU harness runs) but **not yet measured on the T4** — the
+predictions and decision rules are pre-registered in `docs/pass4-plan.md`,
+and `notebooks/pass4-t4.ipynb` is the measurement session. Everything is
+opt-in until the numbers exist:
+
+- **`--dual-gpu`** — batch-split data parallelism across the measurement
+  box's two T4s, with stream/event choreography that keeps the harness's
+  cuda:0 event timing sound (zero host syncs) and numerics
+  element-identical to single-GPU. Predicted: case 6 198.6 -> ~128 ms
+  (~11.4x), case 8 ~1.75x, case 13 ~1.69x, case 14 ~2x; an environment
+  extension, never the submission configuration.
+- **`--fused-out-proj` / `--fused-ffn`** — Triton GEMM epilogues folding
+  bias+residual+LayerNorm into out_proj/ffn_out and bias+erf-GELU into
+  ffn_in (d_model <= 128, fp16). Predicted: case 6 -15-31 ms, the graphed
+  cases lose ~12 in-graph kernels. The residual add consumes the unrounded
+  fp32 accumulator — statistically tighter than the eager order.
+- **`--attention bmm`** — materialized-score attention (cuBLAS bmm + fused
+  Triton causal softmax) for head_dim > 128, targeting case 8's ~5-9 ms
+  CUTLASS tiny-tile overhead; stress-gated (the fp16 score materialization
+  is a new rounding source).
+- Riders: the dead final residual store is skipped (`write_sum=False`,
+  default on — bitwise-identical output), `--gelu-epilogue` (cuBLASLt
+  tanh-GELU probe, accuracy-risky, measurement only), `--graph-streams 2`
+  (two half-batch chains inside the graph), and the attribution tools
+  `profile_case.py` / `bench_micro.py`.
+- A **pass-4 erratum** corrects pass 3's §2.3: the transpose+reshape after
+  mem-efficient SDPA was always a zero-copy view, so no kernel should be
+  (or now is) justified by deleting it.
+
 ## Status
 
 Passes one to three are implemented and measured (tables above): fused Q/K/V
@@ -351,7 +390,9 @@ manual CUDA-graph capture for the launch-bound shapes, the d<64 fp32
 dispatch, out-of-core case 14 — plus, from pass three, an experimental
 Triton attention kernel kept as a measured negative result, an
 interpreter-runnable kernel test suite, and an independent cross-check of
-the pass-2 numbers from a second T4 session.
+the pass-2 numbers from a second T4 session. Pass four (above) is
+implemented and awaiting its 2x-T4 measurement session; the pass-3 F1-F4
+follow-ups ride along in the same notebook.
 
 ## Limitations and next steps
 

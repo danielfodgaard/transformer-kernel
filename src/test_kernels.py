@@ -25,6 +25,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 import fused_kernels  # noqa: E402
+import gemm_kernels  # noqa: E402
 
 
 def eager_ln(
@@ -91,6 +92,72 @@ def unit_tests(device: torch.device) -> bool:
     got = fused_kernels.ln_fwd(x3, weight, bias, eps, torch.float16)
     want = eager_ln(x3, weight, bias, eps, torch.float16)
     ok &= check("ln_fwd non-contiguous 3d", got, want, 1e-3)
+
+    # write_sum=False must not change the normalized output at all.
+    x = torch.randn(64, 128, device=device)
+    y = torch.randn(64, 128, device=device, dtype=torch.float16)
+    _, h_ref = fused_kernels.add_ln_fwd(x, y, weight, bias, eps, torch.float16)
+    s_none, h = fused_kernels.add_ln_fwd(
+        x, y, weight, bias, eps, torch.float16, write_sum=False
+    )
+    ok &= s_none is None
+    ok &= check("add_ln_fwd write_sum=False", h, h_ref, 0.0)
+    return ok
+
+
+def pass4_unit_tests(device: torch.device) -> bool:
+    """The pass-4 kernels: fused causal softmax and GEMM epilogues."""
+    ok = True
+
+    # Causal softmax vs the baseline op order (upcast, fp32 scale, mask,
+    # fp32 softmax, downcast).
+    for s in (32, 33, 100, 128):
+        scores = (torch.randn(6, s, s, device=device) * 3).to(torch.float16)
+        scale = 0.125
+        got = fused_kernels.causal_softmax_fwd(scores, scale)
+        x = scores.float() * scale
+        blocked = torch.ones((s, s), device=device, dtype=torch.bool).triu(1)
+        want = x.masked_fill(blocked, float("-inf")).softmax(-1).to(torch.float16)
+        ok &= check(f"causal_softmax s={s}", got, want, 1e-3)
+
+    # GEMM + bias + residual add + LayerNorm vs the eager fp32 sequence.
+    for tokens, k_in, n_out in ((256, 128, 128), (100, 128, 128), (256, 512, 128)):
+        a = torch.randn(tokens, k_in, device=device, dtype=torch.float16)
+        w = (torch.randn(n_out, k_in, device=device) * 0.3).to(torch.float16)
+        b = torch.randn(n_out, device=device, dtype=torch.float16)
+        x = torch.randn(tokens, n_out, device=device)
+        ln_w = torch.randn(n_out, device=device) + 1.0
+        ln_b = torch.randn(n_out, device=device)
+
+        s_got, h_got = gemm_kernels.gemm_add_ln_fwd(
+            a, w, b, x, ln_w, ln_b, 1e-5, out_dtype=torch.float16
+        )
+        c = F.linear(a.float(), w.float(), b.float())
+        s_want = x + c
+        h_want = F.layer_norm(s_want, (n_out,), ln_w, ln_b, 1e-5).to(torch.float16)
+        ok &= check(f"gemm_add_ln.sum t{tokens}k{k_in}n{n_out}", s_got, s_want, 2e-3)
+        ok &= check(f"gemm_add_ln.norm t{tokens}k{k_in}n{n_out}", h_got, h_want, 2e-3)
+
+    # GEMM + bias + erf-GELU vs F.gelu(approximate="none").
+    a = torch.randn(256, 128, device=device, dtype=torch.float16)
+    w = (torch.randn(128, 128, device=device) * 0.3).to(torch.float16)
+    b = torch.randn(128, device=device, dtype=torch.float16)
+    got = gemm_kernels.gemm_bias_gelu_fwd(a, w, b)
+    want = F.gelu(F.linear(a.float(), w.float(), b.float()), approximate="none")
+    ok &= check("gemm_bias_gelu", got, want, 2e-3)
+
+    # The real SDPA output layout feeds the fused out_proj with zero copies.
+    q = torch.randn(2, 4, 64, 32, device=device, dtype=torch.float16)
+    ctx = F.scaled_dot_product_attention(q, q, q, is_causal=True, scale=0.176777)
+    a_view = ctx.transpose(1, 2).reshape(2, 64, 128)
+    same_storage = a_view.data_ptr() == ctx.data_ptr()
+    print(f"{'PASS' if same_storage else 'NOTE'} sdpa transpose+reshape is zero-copy: {same_storage}")
+    x = torch.randn(2, 64, 128, device=device)
+    s_got, h_got = gemm_kernels.gemm_add_ln_fwd(
+        a_view, w, b, x, torch.randn(128, device=device) + 1.0,
+        torch.randn(128, device=device), 1e-5, out_dtype=torch.float16
+    )
+    ok &= s_got.shape == x.shape and h_got.shape == x.shape
     return ok
 
 
@@ -167,6 +234,7 @@ def main() -> int:
     torch.manual_seed(0)
 
     ok = unit_tests(device)
+    ok &= pass4_unit_tests(device)
     ok &= end_to_end(device)
 
     print("ALL PASS" if ok else "FAILURES above")

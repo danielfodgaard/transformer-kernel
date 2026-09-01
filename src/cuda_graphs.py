@@ -61,10 +61,18 @@ class _GraphState:
 class GraphedTransformer(OptimizedTransformer):
     """OptimizedTransformer whose dense forward replays as one CUDA graph."""
 
+    # Pass-4 experiment (--graph-streams 2): capture the forward as TWO
+    # half-batch chains forked onto separate streams inside the graph, so
+    # their fixed per-kernel latencies overlap instead of serializing. The
+    # per-element math is untouched (batch rows are independent), only the
+    # schedule changes. 1 = the pass-2 single-stream capture.
+    graph_streams = 1
+
     def __init__(self, config, settings=None) -> None:
         super().__init__(config, settings)
         self._graph_states: Dict[Tuple, _GraphState] = {}
         self._graphs_disabled = False
+        self._fork_side: Optional[torch.cuda.Stream] = None
         # Single-slot dense-mask memo (weakref identity), so replays do not
         # pay the device->host sync of mask.all() on every call.
         self._graph_dense_ref: Optional[weakref.ReferenceType] = None
@@ -148,6 +156,11 @@ class GraphedTransformer(OptimizedTransformer):
         # Capture reads this exact allocation on every replay; keep it alive.
         state.static_x = x
 
+        # The fork stream must exist before capture begins (streams cannot be
+        # created inside a capturing region).
+        if self.graph_streams >= 2 and self._fork_side is None:
+            self._fork_side = torch.cuda.Stream()
+
         # Warm up on a side stream so lazy one-time work (weight cache,
         # cuBLAS handles, autotune) happens outside capture. Standard
         # torch.cuda.graph choreography.
@@ -155,10 +168,40 @@ class GraphedTransformer(OptimizedTransformer):
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
-                super().forward(state.static_x, None)
+                self._captureable_forward(state.static_x)
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            state.static_out = super().forward(state.static_x, None)
+            state.static_out = self._captureable_forward(state.static_x)
         state.graph = graph
+
+    def _captureable_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.graph_streams >= 2 and x.shape[0] >= 2:
+            return self._forked_forward(x)
+        return OptimizedTransformer.forward(self, x, None)
+
+    def _forked_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Two half-batch dependency chains on two streams, joined before the
+        output assembly. Events (not host syncs) express the fork and join,
+        so the pattern is capture-legal and the resulting graph runs the two
+        chains concurrently."""
+        n0 = x.shape[0] - x.shape[0] // 2
+        main = torch.cuda.current_stream()
+        side = self._fork_side
+
+        fork = torch.cuda.Event()
+        fork.record(main)
+        side.wait_event(fork)
+        with torch.cuda.stream(side):
+            out_b = OptimizedTransformer.forward(self, x[n0:], None)
+        out_a = OptimizedTransformer.forward(self, x[:n0], None)
+
+        join = torch.cuda.Event()
+        join.record(side)
+        main.wait_event(join)
+
+        out = torch.empty_like(x)
+        out[:n0].copy_(out_a)
+        out[n0:].copy_(out_b)
+        return out

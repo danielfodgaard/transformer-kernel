@@ -123,6 +123,13 @@ mem-efficient kernel:
    `[B, S, H·hd]` directly, deleting that pass (the same trick
    ByteTransformer applies to its unpadded MHA epilogue).
 
+   > **Pass-4 erratum:** this point is wrong. The mem-efficient kernel's
+   > output is physically `[B, S, H, hd]`-contiguous returned as a
+   > transposed *view* (torch's meta registration mirrors the CUDA op), so
+   > the `transpose(1, 2).reshape` is zero-copy and there was never a pass
+   > to delete on the SDPA path — one more reason §5's E2 kernel lost.
+   > See `docs/pass4-plan.md` §0.
+
 Case 13 (S=1024) additionally likes larger KV tiles than the general kernel
 picks for hd=32. Prediction: the Triton attention kernel is worth trying on
 cases 11, 13, 9 (hd=128 single head), 1/5 (hd=32); it should lose on case 8

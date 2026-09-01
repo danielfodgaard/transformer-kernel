@@ -105,6 +105,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--proxy-batch-size", type=int, default=8)
 
+    parser.add_argument(
+        "--dual-gpu",
+        action="store_true",
+        help="pass 4: alternate timing chunks across two GPUs (needs 2 "
+        "visible CUDA devices; accuracy still runs single-GPU against the "
+        "fp32 reference). Zero inter-GPU traffic: outputs are discarded in "
+        "the timing phase exactly as in the single-GPU pass.",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--rtol", type=float, default=0.02)
@@ -282,33 +290,59 @@ def benchmark(
     config: bench.TransformerConfig,
     args: argparse.Namespace,
     device: torch.device,
+    candidate2=None,
 ) -> Optional[dict]:
     if device.type != "cuda":
         print("\nbenchmark skipped: CUDA device required")
         return None
 
+    dual = candidate2 is not None
+    device2 = torch.device("cuda", 1) if dual else None
     print(
         f"\n=== Timing (fp16 candidate, chunk={args.chunk_size}, inputs "
-        f"streamed from host) ==="
+        f"streamed from host{', chunks alternating across 2 GPUs' if dual else ''}) ==="
     )
 
     def one_pass() -> None:
-        for x_cpu in cpu_chunks:
-            candidate(x_cpu.to(device))
+        # With two GPUs, even chunks go to cuda:0 and odd chunks to cuda:1.
+        # The pageable H2D copy blocks the host briefly, but each forward is
+        # enqueued asynchronously, so while one GPU crunches its ~seconds of
+        # kernels the host is already feeding the other -- compute on the two
+        # devices overlaps almost fully at this chunk size. Outputs are
+        # discarded, so no inter-GPU traffic exists.
+        for index, x_cpu in enumerate(cpu_chunks):
+            if dual and index % 2 == 1:
+                candidate2(x_cpu.to(device2))
+            else:
+                candidate(x_cpu.to(device))
+
+    def sync_all() -> None:
+        torch.cuda.synchronize(device)
+        if dual:
+            torch.cuda.synchronize(device2)
 
     samples_ms: List[float] = []
     with torch.inference_mode():
         for _ in range(args.warmup):
             one_pass()
-        torch.cuda.synchronize(device)
+        sync_all()
         for _ in range(args.repeats):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            one_pass()
-            end.record()
-            torch.cuda.synchronize(device)
-            samples_ms.append(start.elapsed_time(end))
+            if dual:
+                # CUDA events on one device cannot cover the other's work, so
+                # the dual pass is timed by wall clock between full syncs --
+                # honest at these multi-second pass times.
+                began = time.perf_counter()
+                one_pass()
+                sync_all()
+                samples_ms.append((time.perf_counter() - began) * 1000.0)
+            else:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                one_pass()
+                end.record()
+                torch.cuda.synchronize(device)
+                samples_ms.append(start.elapsed_time(end))
 
     median_ms = statistics.median(samples_ms)
     tokens = config.batch_size * config.seq_len
@@ -359,7 +393,19 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    timing = benchmark(candidate, cpu_chunks, config, args, device)
+    candidate2 = None
+    if args.dual_gpu:
+        if device.type == "cuda" and torch.cuda.device_count() >= 2:
+            # Same weights, second device. Numerics are irrelevant for the
+            # timing pass (outputs discarded) but keeping the weights
+            # identical means a chunk computes the same result either way.
+            candidate2 = OptimizedTransformer(config, CANDIDATE_SETTINGS)
+            candidate2.load_state_dict(candidate.state_dict())
+            candidate2 = candidate2.to(torch.device("cuda", 1)).eval()
+        else:
+            print("[dual-gpu] fewer than two visible GPUs; timing single-GPU")
+
+    timing = benchmark(candidate, cpu_chunks, config, args, device, candidate2)
 
     if args.out:
         out_path = pathlib.Path(args.out)

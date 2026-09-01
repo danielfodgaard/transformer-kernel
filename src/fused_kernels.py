@@ -43,6 +43,7 @@ patching in run_case.py.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -55,13 +56,20 @@ try:
 except ImportError:  # pragma: no cover - CPU-only environments
     HAVE_TRITON = False
 
+# Triton's numpy interpreter runs these kernels on CPU tensors for testing.
+_INTERPRET = os.environ.get("TRITON_INTERPRET", "0") == "1"
+
 # One program normalizes one row, so the row must fit in a single block.
 MAX_FUSED_SIZE = 8192
 
 
 def can_fuse(x: torch.Tensor) -> bool:
     """Whether the fused kernels apply to activations shaped like ``x``."""
-    return HAVE_TRITON and x.is_cuda and x.shape[-1] <= MAX_FUSED_SIZE
+    return (
+        HAVE_TRITON
+        and (x.is_cuda or _INTERPRET)
+        and x.shape[-1] <= MAX_FUSED_SIZE
+    )
 
 
 def _num_warps(block: int) -> int:
@@ -126,6 +134,7 @@ if HAVE_TRITON:
         sum_row_stride,
         out_row_stride,
         BLOCK: tl.constexpr,
+        WRITE_SUM: tl.constexpr,
     ):
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK)
@@ -139,11 +148,12 @@ if HAVE_TRITON:
         ).to(tl.float32)
 
         s = x + y
-        tl.store(
-            sum_ptr + row * sum_row_stride + cols,
-            s.to(sum_ptr.dtype.element_ty),
-            mask=mask,
-        )
+        if WRITE_SUM:
+            tl.store(
+                sum_ptr + row * sum_row_stride + cols,
+                s.to(sum_ptr.dtype.element_ty),
+                mask=mask,
+            )
 
         mean = tl.sum(s, axis=0) / n_cols
         centered = tl.where(mask, s - mean, 0.0)
@@ -200,12 +210,19 @@ def add_ln_fwd(
     bias: torch.Tensor,
     eps: float,
     out_dtype: Optional[torch.dtype] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    write_sum: bool = True,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Fused residual add + LayerNorm.
 
     Returns ``(s, h)`` where ``s = x + y`` in ``x``'s dtype (the residual
     stream) and ``h = LayerNorm(s)`` in ``out_dtype`` (the next block input).
     The add and the statistics are computed in fp32 regardless of dtypes.
+
+    ``write_sum=False`` skips the store of ``s`` and returns ``(None, h)``:
+    the final-norm site consumes only ``h``, so the fp32 residual write there
+    is dead -- pass four stopped paying for it (~4 bytes/element). ``h`` is
+    bitwise identical either way; the sum is still computed for the
+    statistics, just never stored.
     """
     assert HAVE_TRITON, "add_ln_fwd called without triton; guard with can_fuse()"
     assert x.shape == y.shape, f"shape mismatch: {x.shape} vs {y.shape}"
@@ -215,7 +232,7 @@ def add_ln_fwd(
     n_cols = shape[-1]
     x2 = x.contiguous().view(-1, n_cols)
     y2 = y.contiguous().view(-1, n_cols)
-    s = torch.empty_like(x2)
+    s = torch.empty_like(x2) if write_sum else x2  # dummy ptr when unused
     h = torch.empty_like(x2, dtype=out_dtype)
 
     block = triton.next_power_of_2(n_cols)
@@ -233,6 +250,99 @@ def add_ln_fwd(
         s.stride(0),
         h.stride(0),
         BLOCK=block,
+        WRITE_SUM=write_sum,
         num_warps=_num_warps(block),
     )
-    return s.view(shape), h.view(shape)
+    return (s.view(shape) if write_sum else None), h.view(shape)
+
+
+# --------------------------------------------------------------------------- #
+# Fused causal softmax (pass four, backs the opt-in --attention bmm path)
+# --------------------------------------------------------------------------- #
+
+# One program normalizes one score row; S must fit a single block.
+MAX_SOFTMAX_SIZE = 8192
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _causal_softmax_kernel(
+        scores_ptr,
+        out_ptr,
+        seq_len,
+        scale,
+        in_row_stride,
+        out_row_stride,
+        BLOCK: tl.constexpr,
+        CAUSAL: tl.constexpr,
+    ):
+        # Row r of the flattened [B*H*S, S] score matrix attends over keys;
+        # its query position within the sequence is r % seq_len.
+        row = tl.program_id(0)
+        q_pos = row % seq_len
+        cols = tl.arange(0, BLOCK)
+        mask = cols < seq_len
+
+        x = tl.load(
+            scores_ptr + row * in_row_stride + cols, mask=mask, other=float("-inf")
+        ).to(tl.float32)
+        # Baseline op order: matmul -> * scale (fp32) -> mask -> fp32 softmax.
+        # fp16 -> fp32 is exact, so scaling after the upcast matches the
+        # baseline's post-matmul fp32 scale bit for bit.
+        x = x * scale
+        if CAUSAL:
+            x = tl.where(cols <= q_pos, x, float("-inf"))
+
+        m = tl.max(x, axis=0)
+        e = tl.exp(x - m)  # -inf rows -> 0; col <= q_pos keeps >= 1 finite entry
+        p = e / tl.sum(e, axis=0)
+
+        tl.store(
+            out_ptr + row * out_row_stride + cols,
+            p.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def can_softmax(scores: torch.Tensor) -> bool:
+    return (
+        HAVE_TRITON
+        and (scores.is_cuda or _INTERPRET)
+        and scores.shape[-1] <= MAX_SOFTMAX_SIZE
+        and scores.stride(-1) == 1
+    )
+
+
+def causal_softmax_fwd(
+    scores: torch.Tensor, scale: float, causal: bool = True
+) -> torch.Tensor:
+    """Fused scale + causal mask + fp32 softmax over the last dim.
+
+    ``scores`` is [..., S, S] (typically [B*H, S, S] fp16 straight out of a
+    batched QK^T matmul). One kernel replaces the eager upcast / scale /
+    masked_fill / softmax / downcast chain; the mask is an index compare, so
+    no mask tensor is ever materialized. Statistics and the exp/sum run in
+    fp32; output is in the input dtype.
+    """
+    assert HAVE_TRITON, "causal_softmax_fwd called without triton; guard with can_softmax()"
+    seq_len = scores.shape[-1]
+    assert scores.shape[-2] == seq_len, "causal softmax expects square [S, S] scores"
+
+    s2 = scores.reshape(-1, seq_len)
+    if s2.stride(-1) != 1:
+        s2 = s2.contiguous()
+    out = torch.empty_like(s2)
+
+    block = triton.next_power_of_2(seq_len)
+    _causal_softmax_kernel[(s2.shape[0],)](
+        s2,
+        out,
+        seq_len,
+        scale,
+        s2.stride(0),
+        out.stride(0),
+        BLOCK=block,
+        CAUSAL=causal,
+        num_warps=_num_warps(block),
+    )
+    return out.view(scores.shape)

@@ -32,6 +32,15 @@ Pass one was PyTorch-level only; pass two adds the first custom kernels:
      a documented negative result and a base for future tuning, not as a
      default. Padding masks, non-fp16 dtypes, and head_dim > 256 fall back
      to SDPA.
+  7. Pass four (opt-in until measured; docs/pass4-plan.md): fused Triton
+     GEMM epilogues on the dense path (``--fused-out-proj`` folds
+     bias+residual+LayerNorm into out_proj, ``--fused-ffn`` ditto for
+     ffn_out plus bias+erf-GELU into ffn_in; ``gemm_kernels.py``);
+     ``--attention bmm`` for head_dim > 128 shapes where the CUTLASS kernel
+     is off its fast path (case 8); a cuBLASLt tanh-GELU probe
+     (``--gelu-epilogue``); and batch-split dual-GPU execution for 2x-T4
+     environments (``--dual-gpu``, ``dual_gpu.py``). The final residual
+     write of the fused path is now skipped (dead store; ``write_sum``).
 
 Hard constraints imposed by the benchmark (see docs/pass1-decisions.md):
 
@@ -55,6 +64,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import fused_kernels
+import gemm_kernels
 import kernels
 from torch_transformer_benchmark import BaselineTransformer, TransformerConfig
 
@@ -101,6 +111,13 @@ class OptimizerSettings:
     # triton -- the pass-3 FlashAttention-2-style kernel (kernels.py);
     #           measured slower than sdpa on the T4, kept as an experiment.
     #           Falls back to sdpa off the dense-fp16 supported envelope.
+    # bmm    -- pass-4 experiment for head_dim > 128 (appendix case 8), where
+    #           the CUTLASS mem-efficient kernel falls off its fast path:
+    #           cuBLAS batched QK^T materializing the (small) fp16 score
+    #           tensor, one fused Triton scale+causal-mask+fp32-softmax
+    #           kernel, cuBLAS PV. Dense causal fp16 only; the score tensor
+    #           must stay under _BMM_MAX_SCORE_BYTES (excludes case 13).
+    #           Falls back to sdpa off that envelope.
     # math   -- the baseline's explicit attention, kept for bisecting numerics.
     attention: str = "sdpa"
 
@@ -138,8 +155,29 @@ class OptimizerSettings:
     # 100000000) if seed-robustness on case 6 matters more than its speed.
     fp16_max_elements: int = 0
 
+    # Pass-4 fused Triton GEMM epilogues (gemm_kernels.py), opt-in until
+    # measured on the T4. fused_out_proj folds bias + residual add + LayerNorm
+    # into the attention output projection; fused_ffn does the same for
+    # ffn_out and additionally fuses bias + erf-GELU into ffn_in. Both apply
+    # only on the dense fused path with fp16 compute and d_model (and, for
+    # fused_ffn, ffn_dim) within gemm_kernels.can_fuse_gemm's envelope.
+    fused_out_proj: bool = False
+    fused_ffn: bool = False
+
+    # Pass-4 probe: route ffn_in through cuBLASLt's fused bias+GELU epilogue
+    # (torch.ops.aten._addmm_activation). CAUTION: cuBLASLt applies the tanh
+    # GELU approximation, a ~1e-3-class perturbation vs the baseline's exact
+    # erf -- the thin-margin cases (6, 7) may not absorb it. Opt-in,
+    # measurement-only; ignored when fused_ffn already covers the site.
+    gelu_epilogue: bool = False
+
 
 _ACTIVE = OptimizerSettings()
+
+try:  # cuBLASLt fused bias+GELU epilogue availability (torch build dependent)
+    _HAS_ADDMM_ACTIVATION = hasattr(torch.ops.aten, "_addmm_activation")
+except Exception:  # pragma: no cover - defensive
+    _HAS_ADDMM_ACTIVATION = False
 
 
 def configure(**kwargs) -> OptimizerSettings:
@@ -256,7 +294,12 @@ class OptimizedTransformer(BaselineTransformer):
             return None
         if 0 < self.settings.fp16_min_d_model and self.d_model < self.settings.fp16_min_d_model:
             return None  # narrow model: fp16 error exceeds the abs budget
-        if 0 < self.settings.fp16_max_elements < x.numel():
+        # The dual-GPU wrapper (dual_gpu.py) runs this model on a half batch
+        # but pins _dispatch_numel to the FULL batch's element count, so the
+        # fp16_max_elements decision cannot flip between the single-GPU and
+        # split forwards of the same logical call.
+        numel = getattr(self, "_dispatch_numel", None) or x.numel()
+        if 0 < self.settings.fp16_max_elements < numel:
             return None  # huge output: extreme-value tail exceeds the budget
         if x.dtype in (torch.float16, torch.bfloat16):
             return None  # already reduced precision; leave it alone
@@ -504,9 +547,28 @@ class OptimizedTransformer(BaselineTransformer):
         norm after the FFN), so two fused calls per layer carry the whole
         stream, and the final fused call emits the model output directly.
         Padding masks never reach this path.
+
+        The pass-4 opt-in kernels (gemm_kernels.py) push the fusion into the
+        GEMMs themselves: --fused-out-proj folds bias + residual add +
+        LayerNorm into the out_proj GEMM, --fused-ffn does the same for
+        ffn_out and fuses bias + erf-GELU into ffn_in. The residual add then
+        consumes the UNROUNDED fp32 GEMM accumulator instead of its fp16
+        store -- statistically tighter than the eager order, but a different
+        fp32 summation order than cuBLAS (same reduction-order noise class as
+        the LN kernels).
         """
         matmul_dtype = compute_dtype if compute_dtype is not None else x.dtype
         last = len(weights) - 1
+        ffn_dim = self.config.ffn_dim
+
+        fuse_out_proj = self.settings.fused_out_proj and gemm_kernels.can_fuse_gemm(
+            x, self.d_model, self.d_model, matmul_dtype
+        )
+        fuse_ffn = (
+            self.settings.fused_ffn
+            and gemm_kernels.can_fuse_gemm(x, ffn_dim, self.d_model, matmul_dtype)
+            and gemm_kernels.can_fuse_gemm(x, self.d_model, ffn_dim, matmul_dtype)
+        )
 
         h = fused_kernels.ln_fwd(
             x,
@@ -517,40 +579,86 @@ class OptimizedTransformer(BaselineTransformer):
         )
         out = x  # always overwritten; num_layers is validated positive
         for index, layer_weights in enumerate(weights):
-            attn_out = self._attention_block(
-                h, layer_weights, batch, seq_len, None, causal
-            )
-            x, h = fused_kernels.add_ln_fwd(
-                x,
-                attn_out,
-                layer_weights.norm2_weight,
-                layer_weights.norm2_bias,
-                layer_weights.norm2_eps,
-                out_dtype=matmul_dtype,
-            )
-            ffn_out = self._ffn_block(h, layer_weights)
-            if index < last:
-                next_weights = weights[index + 1]
-                x, h = fused_kernels.add_ln_fwd(
+            if fuse_out_proj:
+                context = self._attention_context(
+                    h, layer_weights, batch, seq_len, None, causal
+                )
+                x, h = gemm_kernels.gemm_add_ln_fwd(
+                    context,
+                    layer_weights.out_weight,
+                    layer_weights.out_bias,
                     x,
-                    ffn_out,
-                    next_weights.norm1_weight,
-                    next_weights.norm1_bias,
-                    next_weights.norm1_eps,
+                    layer_weights.norm2_weight,
+                    layer_weights.norm2_bias,
+                    layer_weights.norm2_eps,
                     out_dtype=matmul_dtype,
                 )
             else:
-                # The last residual add feeds final_norm directly, so the
-                # final fused call produces the model output; the summed
-                # residual it also writes is dead.
-                _, out = fused_kernels.add_ln_fwd(
-                    x,
-                    ffn_out,
-                    self.final_norm.weight,
-                    self.final_norm.bias,
-                    self.final_norm.eps,
-                    out_dtype=x.dtype,
+                attn_out = self._attention_block(
+                    h, layer_weights, batch, seq_len, None, causal
                 )
+                x, h = fused_kernels.add_ln_fwd(
+                    x,
+                    attn_out,
+                    layer_weights.norm2_weight,
+                    layer_weights.norm2_bias,
+                    layer_weights.norm2_eps,
+                    out_dtype=matmul_dtype,
+                )
+
+            if fuse_ffn:
+                mid = gemm_kernels.gemm_bias_gelu_fwd(
+                    h, layer_weights.ffn_in_weight, layer_weights.ffn_in_bias
+                )
+                if index < last:
+                    next_weights = weights[index + 1]
+                    x, h = gemm_kernels.gemm_add_ln_fwd(
+                        mid,
+                        layer_weights.ffn_out_weight,
+                        layer_weights.ffn_out_bias,
+                        x,
+                        next_weights.norm1_weight,
+                        next_weights.norm1_bias,
+                        next_weights.norm1_eps,
+                        out_dtype=matmul_dtype,
+                    )
+                else:
+                    _, out = gemm_kernels.gemm_add_ln_fwd(
+                        mid,
+                        layer_weights.ffn_out_weight,
+                        layer_weights.ffn_out_bias,
+                        x,
+                        self.final_norm.weight,
+                        self.final_norm.bias,
+                        self.final_norm.eps,
+                        out_dtype=x.dtype,
+                        write_sum=False,
+                    )
+            else:
+                ffn_out = self._ffn_block(h, layer_weights)
+                if index < last:
+                    next_weights = weights[index + 1]
+                    x, h = fused_kernels.add_ln_fwd(
+                        x,
+                        ffn_out,
+                        next_weights.norm1_weight,
+                        next_weights.norm1_bias,
+                        next_weights.norm1_eps,
+                        out_dtype=matmul_dtype,
+                    )
+                else:
+                    # The last residual add feeds final_norm directly, so the
+                    # final fused call produces the model output; the summed
+                    # residual is dead and write_sum=False skips its store.
+                    _, out = fused_kernels.add_ln_fwd(
+                        x,
+                        ffn_out,
+                        self.final_norm.weight,
+                        self.final_norm.bias,
+                        self.final_norm.eps,
+                        out_dtype=x.dtype,
+                        write_sum=False,
+                    )
         return out
 
     def _attention_block(
@@ -568,12 +676,50 @@ class OptimizedTransformer(BaselineTransformer):
         the return value is the attention branch output before the residual
         add, in the same dtype.
         """
+        context = self._attention_context(
+            h, layer_weights, batch, seq_len, attn_allow, use_is_causal
+        )
+        return F.linear(context, layer_weights.out_weight, layer_weights.out_bias)
+
+    def _attention_context(
+        self,
+        h: torch.Tensor,
+        layer_weights: _LayerWeights,
+        batch: int,
+        seq_len: int,
+        attn_allow: Optional[torch.Tensor],
+        use_is_causal: bool,
+    ) -> torch.Tensor:
+        """Q/K/V projection and attention, returning the merged-head context
+        ``[B, S, d_model]`` ready for the output projection (eager F.linear or
+        the pass-4 fused GEMM+add+LN kernel).
+
+        Note on the final ``transpose(1, 2).reshape``: for the mem-efficient
+        SDPA backend (the only tensor-core backend on sm_75) this is a FREE
+        view -- the kernel returns a [B, S, H, hd]-contiguous tensor
+        transposed, so no copy happens (pass-4 erratum to the pass-3 docs,
+        which assumed a real pass). It is a real copy only on the math and
+        bmm paths, whose score-materializing bmms produce [B, H, S, hd].
+        """
+        use_bmm = (
+            self.settings.attention == "bmm"
+            and attn_allow is None
+            and use_is_causal
+            and self._bmm_supported(h, batch, seq_len)
+        )
+
         if layer_weights.qkv_weight is not None:
             qkv = F.linear(h, layer_weights.qkv_weight, layer_weights.qkv_bias)
             # qkv is contiguous, so this view is free. Layout is
             # [B, S, {q,k,v}, H, head_dim] -> three [B, H, S, head_dim].
             qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
-            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+            perm = qkv.permute(2, 0, 3, 1, 4)
+            if use_bmm:
+                # torch.bmm needs flattenable [B*H, S, hd] operands, which
+                # the permuted view's strides cannot provide; one contiguous
+                # copy materializes all three at once.
+                perm = perm.contiguous()
+            q, k, v = perm.unbind(0)
         else:
             q = self._split_heads(
                 F.linear(h, layer_weights.q_weight, layer_weights.q_bias),
@@ -596,22 +742,18 @@ class OptimizedTransformer(BaselineTransformer):
             and attn_allow is None
             and kernels.attention_supported(self.head_dim, q.dtype, q.device)
         ):
-            # Pass-3 experimental kernel. It writes [B, S, H*hd] directly, so
-            # the transpose+reshape pass before the output projection
-            # disappears; q/k/v are consumed through their strides with no
-            # .contiguous() copies.
-            context = kernels.flash_attention(
-                q, k, v, self.attn_scale, use_is_causal
-            )
-            return F.linear(
-                context, layer_weights.out_weight, layer_weights.out_bias
-            )
+            # Pass-3 experimental kernel; writes [B, S, H*hd] directly and
+            # consumes q/k/v through their strides with no .contiguous().
+            return kernels.flash_attention(q, k, v, self.attn_scale, use_is_causal)
 
-        if self.settings.attention == "math":
+        if use_bmm:
+            context = self._bmm_attention(q, k, v, batch, seq_len)
+        elif self.settings.attention == "math":
             context = self._math_attention(q, k, v, attn_allow, use_is_causal)
         else:
-            # "sdpa", and the fallback whenever "triton" is off its envelope
-            # (padding mask, non-fp16 dtype, unsupported head_dim, no triton).
+            # "sdpa", and the fallback whenever "triton"/"bmm" are off their
+            # envelopes (padding mask, non-fp16 dtype, unsupported head_dim
+            # or score size, no triton).
             with _sdpa_backend(self.settings.sdpa_backend):
                 context = F.scaled_dot_product_attention(
                     q,
@@ -623,17 +765,83 @@ class OptimizedTransformer(BaselineTransformer):
                     scale=self.attn_scale,
                 )
 
-        context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
-        return F.linear(context, layer_weights.out_weight, layer_weights.out_bias)
+        return context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+
+    # Ceiling on the materialized fp16 score tensor for --attention bmm.
+    # 64 MB admits case 8 (B64 H4 S128: 8.4 MB) and excludes case 13
+    # (B64 H4 S1024: 536 MB), where streaming SDPA is the whole point.
+    _BMM_MAX_SCORE_BYTES = 64 * 1024 * 1024
+
+    def _bmm_supported(self, h: torch.Tensor, batch: int, seq_len: int) -> bool:
+        """Envelope for the pass-4 bmm attention path (dense causal only --
+        the caller already checked mask and causality)."""
+        if not fused_kernels.HAVE_TRITON:
+            return False
+        if not (h.is_cuda or fused_kernels._INTERPRET):
+            return False
+        if h.dtype != torch.float16 and not fused_kernels._INTERPRET:
+            return False
+        if seq_len > fused_kernels.MAX_SOFTMAX_SIZE:
+            return False
+        score_bytes = batch * self.num_heads * seq_len * seq_len * h.element_size()
+        return score_bytes <= self._BMM_MAX_SCORE_BYTES
+
+    def _bmm_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Materialized-score causal attention for shapes where the CUTLASS
+        mem-efficient kernel is off its fast path (head_dim > 128: appendix
+        case 8). cuBLAS batched QK^T in fp16 (fp32 accumulate), one fused
+        Triton scale+causal-mask+fp32-softmax kernel, cuBLAS PV.
+
+        Numerics note: unlike SDPA, which keeps scores in fp32 accumulator
+        registers through its softmax, this path rounds the pre-softmax
+        scores to fp16 once -- a genuinely new error source, which is why the
+        path is opt-in and stress-gated before it can enter the dispatch
+        table. The softmax itself upcasts to fp32, scales after the (exact)
+        upcast, masks by index compare, and reduces in fp32 -- the baseline's
+        op order.
+        """
+        bh = batch * self.num_heads
+        q2 = q.reshape(bh, seq_len, self.head_dim)
+        k2 = k.reshape(bh, seq_len, self.head_dim)
+        v2 = v.reshape(bh, seq_len, self.head_dim)
+        scores = torch.bmm(q2, k2.transpose(1, 2))
+        probs = fused_kernels.causal_softmax_fwd(scores, self.attn_scale)
+        context = torch.bmm(probs, v2)
+        return context.view(batch, self.num_heads, seq_len, self.head_dim)
 
     def _ffn_block(
         self, h: torch.Tensor, layer_weights: _LayerWeights
     ) -> torch.Tensor:
-        h = F.linear(h, layer_weights.ffn_in_weight, layer_weights.ffn_in_bias)
-        # approximate="none" (erf) matches the baseline exactly; the tanh
-        # approximation would introduce a needless ~1e-3 difference.
-        h = F.gelu(h, approximate="none")
-        return F.linear(h, layer_weights.ffn_out_weight, layer_weights.ffn_out_bias)
+        if (
+            self.settings.gelu_epilogue
+            and h.is_cuda
+            and _HAS_ADDMM_ACTIVATION
+        ):
+            # Pass-4 probe: cuBLASLt's fused bias+GELU epilogue saves one
+            # full read+write of the [tokens, ffn_dim] tensor and a launch,
+            # but computes the TANH GELU approximation (~1e-3-class deviation
+            # from the baseline's erf). Opt-in and stress-gated; see
+            # OptimizerSettings.gelu_epilogue.
+            t2 = h.reshape(-1, h.shape[-1])
+            mid = torch.ops.aten._addmm_activation(
+                layer_weights.ffn_in_bias,
+                t2,
+                layer_weights.ffn_in_weight.t(),
+                use_gelu=True,
+            ).view(*h.shape[:-1], layer_weights.ffn_in_weight.shape[0])
+        else:
+            mid = F.linear(h, layer_weights.ffn_in_weight, layer_weights.ffn_in_bias)
+            # approximate="none" (erf) matches the baseline exactly; the tanh
+            # approximation would introduce a needless ~1e-3 difference.
+            mid = F.gelu(mid, approximate="none")
+        return F.linear(mid, layer_weights.ffn_out_weight, layer_weights.ffn_out_bias)
 
     def _split_heads(
         self, projected: torch.Tensor, batch: int, seq_len: int

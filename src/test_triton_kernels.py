@@ -36,6 +36,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import fused_kernels  # noqa: E402
+import gemm_kernels  # noqa: E402
 import kernels  # noqa: E402
 
 INTERPRET = os.environ.get("TRITON_INTERPRET", "0") == "1"
@@ -223,3 +224,201 @@ def test_supported_probes():
     assert not kernels.attention_supported(512, torch.float16, dev)
     if not INTERPRET:
         assert not kernels.attention_supported(64, torch.float32, dev)
+
+
+# --------------------------------------------------------------------------- #
+# fused_kernels: add_ln write_sum variant + causal softmax (pass 4)
+# --------------------------------------------------------------------------- #
+
+
+def test_add_ln_write_sum_false_matches():
+    d, rows = 128, 32
+    x = _seeded(rows, d, seed=31)
+    residual = _seeded(rows, d, seed=32)
+    weight = _seeded(d, seed=33) + 1.0
+    bias = _seeded(d, seed=34)
+
+    s_ref, h_ref = fused_kernels.add_ln_fwd(x, residual, weight, bias, 1e-5)
+    s_none, h = fused_kernels.add_ln_fwd(
+        x, residual, weight, bias, 1e-5, write_sum=False
+    )
+    assert s_none is None and s_ref is not None
+    torch.testing.assert_close(h, h_ref, atol=0.0, rtol=0.0)
+
+
+def _softmax_reference(scores, scale, causal):
+    """The baseline's op order: upcast (exact), fp32 scale, -inf mask, fp32
+    softmax, cast back to the score dtype."""
+    x = scores.float() * scale
+    if causal:
+        s = scores.shape[-1]
+        blocked = torch.ones(
+            (s, s), device=scores.device, dtype=torch.bool
+        ).triu(diagonal=1)
+        x = x.masked_fill(blocked, float("-inf"))
+    return torch.softmax(x, dim=-1).to(scores.dtype)
+
+
+@pytest.mark.parametrize("s", [16, 32, 33, 100, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_causal_softmax_matches_reference(s, dtype, causal):
+    bh = 6
+    scores = _seeded(bh, s, s, dtype=dtype, seed=s, scale=3.0)
+    scale = 0.17677669529663687  # 32 ** -0.5
+
+    out = fused_kernels.causal_softmax_fwd(scores, scale, causal=causal)
+    ref = _softmax_reference(scores, scale, causal)
+
+    assert out.shape == scores.shape and out.dtype == scores.dtype
+    tol = dict(atol=2e-3, rtol=2e-2) if dtype == torch.float16 else dict(
+        atol=1e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(out, ref, **tol)
+    if causal:
+        # Above-diagonal probabilities must be exactly zero.
+        upper = torch.ones((s, s), dtype=torch.bool).triu(diagonal=1)
+        assert float(out[:, upper].abs().max()) == 0.0
+
+
+def test_causal_softmax_four_dim_input():
+    b, h, s = 2, 3, 64
+    scores = _seeded(b, h, s, s, dtype=torch.float16, seed=9)
+    out = fused_kernels.causal_softmax_fwd(scores, 0.25)
+    ref = _softmax_reference(scores, 0.25, causal=True)
+    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-2)
+
+
+# --------------------------------------------------------------------------- #
+# gemm_kernels: fused GEMM + bias + residual + LayerNorm / + GELU (pass 4)
+# --------------------------------------------------------------------------- #
+
+GEMM_SITES = [
+    # (tokens, k_in, n_out) -- out_proj-like (k == n) and ffn_out-like
+    # (k != n) shapes, tile-aligned and ragged, incl. a non-pow2 row width.
+    (256, 128, 128),
+    (100, 128, 128),
+    (64, 64, 64),
+    (256, 512, 128),
+    (48, 128, 100),
+]
+
+
+def _gemm_reference(a, w, b, x, ln_w, ln_b, eps):
+    """The eager pair this kernel replaces, minus the intermediate fp16
+    rounding of the GEMM output (the kernel feeds LN the fp32 accumulator,
+    which is the tighter order)."""
+    c = torch.nn.functional.linear(a.float(), w.float(), b.float())
+    s = x.float() + c
+    h = torch.nn.functional.layer_norm(s, (w.shape[0],), ln_w, ln_b, eps)
+    return s, h
+
+
+@pytest.mark.parametrize("site", GEMM_SITES, ids=lambda s: "t{}k{}n{}".format(*s))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_gemm_add_ln_matches_reference(site, dtype):
+    if dtype == torch.float32 and not INTERPRET:
+        pytest.skip("fp32 tl.dot has no tensor-core path on sm_75; gated off")
+    tokens, k_in, n_out = site
+    a = _seeded(tokens, k_in, dtype=dtype, seed=1)
+    w = _seeded(n_out, k_in, dtype=dtype, seed=2, scale=0.3)
+    b = _seeded(n_out, dtype=dtype, seed=3)
+    x = _seeded(tokens, n_out, seed=4)
+    ln_w = _seeded(n_out, seed=5, scale=0.5) + 1.0
+    ln_b = _seeded(n_out, seed=6, scale=0.5)
+
+    # The fp16 case exercises the production configuration (fp16 in, fp16
+    # out); the fp32 interpreter case pins the epilogue math tightly with an
+    # fp32 output, so no store rounding blurs the comparison.
+    out_dtype = torch.float16 if dtype == torch.float16 else torch.float32
+    s, h = gemm_kernels.gemm_add_ln_fwd(
+        a, w, b, x, ln_w, ln_b, 1e-5, out_dtype=out_dtype
+    )
+    s_ref, h_ref = _gemm_reference(a, w, b, x, ln_w, ln_b, 1e-5)
+
+    assert s.dtype == x.dtype and h.dtype == out_dtype
+    tol = dict(atol=2e-3, rtol=2e-2) if dtype == torch.float16 else dict(
+        atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(s, s_ref.to(s.dtype), **tol)
+    torch.testing.assert_close(h.float(), h_ref, **tol)
+
+
+def test_gemm_add_ln_write_sum_false():
+    a = _seeded(64, 128, dtype=torch.float16, seed=11)
+    w = _seeded(128, 128, dtype=torch.float16, seed=12, scale=0.3)
+    b = _seeded(128, dtype=torch.float16, seed=13)
+    x = _seeded(64, 128, seed=14)
+    ln_w = _seeded(128, seed=15) + 1.0
+    ln_b = _seeded(128, seed=16)
+
+    s_ref, h_ref = gemm_kernels.gemm_add_ln_fwd(a, w, b, x, ln_w, ln_b, 1e-5)
+    s, h = gemm_kernels.gemm_add_ln_fwd(
+        a, w, b, x, ln_w, ln_b, 1e-5, write_sum=False
+    )
+    assert s is None and s_ref is not None
+    torch.testing.assert_close(h, h_ref, atol=0.0, rtol=0.0)
+
+
+def test_gemm_add_ln_real_sdpa_layout():
+    """Feed the wrapper the exact tensor optimized.py produces: the
+    mem-efficient SDPA output is [B, S, H, hd]-contiguous returned as a
+    transpose(1, 2) view, and the model reshapes it back -- a free view, not
+    a copy (pass-4 erratum). The kernel must consume it unchanged."""
+    b, h, s, hd = 2, 4, 32, 32
+    d = h * hd
+    sdpa_native = _seeded(b, s, h, hd, dtype=torch.float16, seed=21)
+    context = sdpa_native.transpose(1, 2)  # what SDPA hands back: [B, H, S, hd]
+    a = context.transpose(1, 2).reshape(b, s, d)  # what the model builds
+    assert a.data_ptr() == sdpa_native.data_ptr()  # genuinely zero-copy
+
+    w = _seeded(d, d, dtype=torch.float16, seed=22, scale=0.2)
+    bias = _seeded(d, dtype=torch.float16, seed=23)
+    x = _seeded(b, s, d, seed=24)
+    ln_w = _seeded(d, seed=25) + 1.0
+    ln_b = _seeded(d, seed=26)
+
+    s_out, h_out = gemm_kernels.gemm_add_ln_fwd(
+        a, w, bias, x, ln_w, ln_b, 1e-5, out_dtype=torch.float16
+    )
+    s_ref, h_ref = _gemm_reference(
+        a.reshape(-1, d), w, bias, x.reshape(-1, d), ln_w, ln_b, 1e-5
+    )
+    torch.testing.assert_close(
+        s_out.reshape(-1, d), s_ref.to(s_out.dtype), atol=2e-3, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        h_out.reshape(-1, d).float(), h_ref, atol=2e-3, rtol=2e-2
+    )
+
+
+@pytest.mark.parametrize("site", [(256, 128, 128), (100, 64, 128), (64, 128, 100)],
+                         ids=lambda s: "t{}k{}n{}".format(*s))
+def test_gemm_bias_gelu_matches_erf_reference(site):
+    tokens, k_in, n_out = site
+    a = _seeded(tokens, k_in, dtype=torch.float16, seed=41)
+    w = _seeded(n_out, k_in, dtype=torch.float16, seed=42, scale=0.3)
+    b = _seeded(n_out, dtype=torch.float16, seed=43)
+
+    out = gemm_kernels.gemm_bias_gelu_fwd(a, w, b)
+    ref = torch.nn.functional.gelu(
+        torch.nn.functional.linear(a.float(), w.float(), b.float()),
+        approximate="none",
+    )
+    assert out.dtype == a.dtype and out.shape == (tokens, n_out)
+    torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=2e-2)
+
+
+def test_gemm_envelope_guards():
+    cpu = torch.zeros(4, 4)
+    if INTERPRET:
+        assert gemm_kernels.can_fuse_gemm(cpu, 128, 128)
+    else:
+        assert not gemm_kernels.can_fuse_gemm(cpu, 128, 128)
+    dummy = cpu if INTERPRET else cpu.cuda() if HAVE_CUDA else cpu
+    if HAVE_CUDA or INTERPRET:
+        assert not gemm_kernels.can_fuse_gemm(dummy, 1024, 128)  # case 8
+        assert not gemm_kernels.can_fuse_gemm(dummy, 128, 8)  # tl.dot K >= 16
+        assert not gemm_kernels.can_fuse_gemm(
+            dummy, 128, 128, compute_dtype=None
+        ) or INTERPRET  # fp32 dispatch stays eager on hardware

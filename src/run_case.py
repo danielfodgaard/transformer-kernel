@@ -10,13 +10,22 @@ Every flag the benchmark defines still works and is passed straight through;
 the flags added here all control the optimized implementation:
 
     --precision {fp16,autocast,fp32}   how the matmuls are run
-    --attention {sdpa,triton,math}     SDPA, the experimental pass-3 Triton
-                                       flash kernel (measured slower on T4),
-                                       or the baseline's attention
+    --attention {sdpa,triton,bmm,math} SDPA; the experimental pass-3 Triton
+                                       flash kernel (measured slower on T4);
+                                       the pass-4 materialized-score bmm path
+                                       for head_dim > 128 (case 8); or the
+                                       baseline's attention
     --sdpa-backend {auto,efficient,math,flash}
     --no-fuse-qkv                      keep three separate Q/K/V matmuls
     --no-fused-norm                    eager residual+LayerNorm chain instead
                                        of the fused Triton kernels
+    --fused-out-proj                   pass-4: fold bias+residual+LayerNorm
+                                       into the out_proj GEMM (Triton)
+    --fused-ffn                        pass-4: same for ffn_out, plus fused
+                                       bias+erf-GELU into ffn_in (Triton)
+    --gelu-epilogue                    pass-4 probe: cuBLASLt fused bias+GELU
+                                       for ffn_in -- TANH approximation, may
+                                       cost accuracy margin; measurement only
     --assume-dense-mask                skip the all-True mask check (sync)
     --fp32-reductions                  forbid fp16 partial-sum accumulation
                                        inside cuBLAS fp16 matmuls (accuracy-
@@ -25,6 +34,22 @@ the flags added here all control the optimized implementation:
                                        graph and replay it (single launch per
                                        call; do not combine with
                                        --compile-user)
+    --graph-streams N                  pass-4 probe with --cuda-graphs:
+                                       capture the forward as N=2 half-batch
+                                       chains on two streams so per-kernel
+                                       latencies overlap inside the graph
+    --dual-gpu                         pass-4, 2x-T4 environments: split the
+                                       batch across two GPUs (opt-in, an
+                                       environment extension -- never the
+                                       submission configuration). No-op with
+                                       a single visible GPU; small shapes
+                                       stay single-GPU via --dual-min-elements
+    --dual-min-elements N              minimum input elements before --dual-gpu
+                                       splits (default 4000000)
+    --dual-fraction F                  pin the GPU1 batch share (0 < F <= 0.5)
+                                       instead of auto-calibrating
+    --dual-verify                      print max|dual - single| on the first
+                                       eligible calls (untimed phase only)
     --dispatch                         apply the measured-best settings for
                                        this shape from configs/dispatch.json
                                        (generate with src/dispatch.py);
@@ -59,11 +84,19 @@ EXTRA_FLAGS = (
     "--sdpa-backend",
     "--no-fuse-qkv",
     "--no-fused-norm",
+    "--fused-out-proj",
+    "--fused-ffn",
+    "--gelu-epilogue",
     "--assume-dense-mask",
     "--fp16-min-d-model",
     "--fp16-max-elements",
     "--fp32-reductions",
     "--cuda-graphs",
+    "--graph-streams",
+    "--dual-gpu",
+    "--dual-min-elements",
+    "--dual-fraction",
+    "--dual-verify",
     "--dispatch",
     "--reference-check",
 )
@@ -77,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--precision", choices=("fp16", "autocast", "fp32"), default="fp16"
     )
     parser.add_argument(
-        "--attention", choices=("sdpa", "triton", "math"), default="sdpa"
+        "--attention", choices=("sdpa", "triton", "bmm", "math"), default="sdpa"
     )
     parser.add_argument(
         "--sdpa-backend",
@@ -86,11 +119,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-fuse-qkv", action="store_true")
     parser.add_argument("--no-fused-norm", action="store_true")
+    parser.add_argument("--fused-out-proj", action="store_true")
+    parser.add_argument("--fused-ffn", action="store_true")
+    parser.add_argument("--gelu-epilogue", action="store_true")
     parser.add_argument("--fp16-min-d-model", type=int, default=64)
     parser.add_argument("--fp16-max-elements", type=int, default=0)
     parser.add_argument("--assume-dense-mask", action="store_true")
     parser.add_argument("--fp32-reductions", action="store_true")
     parser.add_argument("--cuda-graphs", action="store_true")
+    parser.add_argument("--graph-streams", type=int, default=1)
+    parser.add_argument("--dual-gpu", action="store_true")
+    parser.add_argument("--dual-min-elements", type=int, default=4_000_000)
+    parser.add_argument("--dual-fraction", type=float, default=None)
+    parser.add_argument("--dual-verify", action="store_true")
     parser.add_argument("--dispatch", action="store_true")
     parser.add_argument("--reference-check", action="store_true")
     return parser
@@ -165,6 +206,9 @@ def main() -> int:
             sdpa_backend=args.sdpa_backend,
             fuse_qkv=not args.no_fuse_qkv,
             fused_norm=not args.no_fused_norm,
+            fused_out_proj=args.fused_out_proj,
+            fused_ffn=args.fused_ffn,
+            gelu_epilogue=args.gelu_epilogue,
             assume_dense_mask=args.assume_dense_mask,
             fp16_min_d_model=args.fp16_min_d_model,
             fp16_max_elements=args.fp16_max_elements,
@@ -179,9 +223,26 @@ def main() -> int:
                 )
             import cuda_graphs  # deferred: pulls in the CUDA graph wrapper
 
-            bench.UserOptimizedTransformer = cuda_graphs.GraphedTransformer
+            if args.graph_streams > 1:
+                cuda_graphs.GraphedTransformer.graph_streams = args.graph_streams
+            model_cls = cuda_graphs.GraphedTransformer
         else:
-            bench.UserOptimizedTransformer = optimized.OptimizedTransformer
+            model_cls = optimized.OptimizedTransformer
+        if args.dual_gpu:
+            if "--compile-user" in passthrough:
+                print(
+                    "[warning] --dual-gpu with --compile-user is unsupported; "
+                    "the dual region always runs eager"
+                )
+            import dual_gpu  # deferred: pulls in the dual-GPU wrapper
+
+            model_cls = dual_gpu.make_dual(
+                model_cls,
+                min_elements=args.dual_min_elements,
+                fraction=args.dual_fraction,
+                verify=args.dual_verify,
+            )
+        bench.UserOptimizedTransformer = model_cls
         print(
             "optimizer: "
             f"precision={settings.precision} "
@@ -189,12 +250,19 @@ def main() -> int:
             f"sdpa_backend={settings.sdpa_backend} "
             f"fuse_qkv={settings.fuse_qkv} "
             f"fused_norm={settings.fused_norm} "
+            f"fused_out_proj={settings.fused_out_proj} "
+            f"fused_ffn={settings.fused_ffn} "
+            f"gelu_epilogue={settings.gelu_epilogue} "
             f"assume_dense_mask={settings.assume_dense_mask} "
             f"fp16_min_d_model={settings.fp16_min_d_model} "
             f"fp16_max_elements={settings.fp16_max_elements} "
             f"fp32_reductions={args.fp32_reductions} "
-            f"cuda_graphs={args.cuda_graphs}"
+            f"cuda_graphs={args.cuda_graphs} "
+            f"graph_streams={args.graph_streams} "
+            f"dual_gpu={args.dual_gpu}"
         )
+        if args.dual_gpu and torch.cuda.is_available() and torch.cuda.device_count() < 2:
+            print("[dual-gpu] fewer than two visible GPUs; running single-GPU")
         if dispatch_note is not None:
             print(f"dispatch: {dispatch_note}")
 
