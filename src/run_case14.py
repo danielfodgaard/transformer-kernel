@@ -310,9 +310,16 @@ def benchmark(
         # kernels the host is already feeding the other -- compute on the two
         # devices overlaps almost fully at this chunk size. Outputs are
         # discarded, so no inter-GPU traffic exists.
+        #
+        # The device guard around the cuda:1 chunks is load-bearing: Triton
+        # binds kernel launches to torch.cuda.current_device()'s stream, so
+        # without it the fused-LN kernels would launch on cuda:0 against
+        # cuda:1 pointers (illegal address) -- the same rule dual_gpu.py
+        # documents and guards for.
         for index, x_cpu in enumerate(cpu_chunks):
             if dual and index % 2 == 1:
-                candidate2(x_cpu.to(device2))
+                with torch.cuda.device(device2):
+                    candidate2(x_cpu.to(device2))
             else:
                 candidate(x_cpu.to(device))
 

@@ -419,6 +419,7 @@ def test_gemm_envelope_guards():
     if HAVE_CUDA or INTERPRET:
         assert not gemm_kernels.can_fuse_gemm(dummy, 1024, 128)  # case 8
         assert not gemm_kernels.can_fuse_gemm(dummy, 128, 8)  # tl.dot K >= 16
+        assert not gemm_kernels.can_fuse_gemm(dummy, 8, 128)  # tl.dot N >= 16
         assert not gemm_kernels.can_fuse_gemm(
             dummy, 128, 128, compute_dtype=None
         ) or INTERPRET  # fp32 dispatch stays eager on hardware

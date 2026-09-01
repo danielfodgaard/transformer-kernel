@@ -98,7 +98,9 @@ def can_fuse_gemm(
         return False
     if compute_dtype != torch.float16 and not _INTERPRET:
         return False
-    return n_out <= MAX_FUSED_N and 16 <= k_in <= MAX_FUSED_K
+    # tl.dot needs both tile dimensions >= 16, so N < 16 (like K < 16) falls
+    # back to the eager pair rather than failing to compile mid-benchmark.
+    return 16 <= n_out <= MAX_FUSED_N and 16 <= k_in <= MAX_FUSED_K
 
 
 def _config(tokens: int, block_n: int) -> Tuple[int, int, int, int]:

@@ -178,7 +178,14 @@ class GraphedTransformer(OptimizedTransformer):
 
     def _captureable_forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.graph_streams >= 2 and x.shape[0] >= 2:
-            return self._forked_forward(x)
+            # The halves must make the fp16_max_elements dispatch decision on
+            # the FULL batch's element count, exactly as dual_gpu.py pins it
+            # for its half-batch forwards.
+            self._dispatch_numel = x.numel()
+            try:
+                return self._forked_forward(x)
+            finally:
+                self._dispatch_numel = None
         return OptimizedTransformer.forward(self, x, None)
 
     def _forked_forward(self, x: torch.Tensor) -> torch.Tensor:
